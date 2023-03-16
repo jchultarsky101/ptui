@@ -1,4 +1,5 @@
-![Twitter URL](https://img.shields.io/badge/Twitter-1DA1F2?style=for-the-badge&logo=twitter&logoColor=white&url=https%3A%2F%2Ftwitter.com%2Fjchultarsky101)
+![Twitter URL](https://img.shields.io/twitter/url?style=for-the-badge&url=https%3A%2F%2Ftwitter.com%2Fjchultarsky101)
+![Codecov](/codecov/c/:vcsName/:user/:repo?flag=flag_name&token=a1b2c3d4e5)
 
 # PTUI - TUI Client for Physna
 
