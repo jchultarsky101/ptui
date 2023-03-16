@@ -1,5 +1,4 @@
-
-!\[github actions\](https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=github-actions&logoColor=white)
+![Twitter URL](https://img.shields.io/twitter/url?style=for-the-badge&url=https%3A%2F%2Ftwitter.com%2Fjchultarsky101)
 
 # PTUI - TUI Client for Physna
 
