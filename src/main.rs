@@ -153,39 +153,23 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut State) {
         .constraints([Constraint::Max(3), Constraint::Min(10), Constraint::Max(3)].as_ref())
         .split(size);
 
-    let search_chunk = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(100)].as_ref())
-        .split(app_container_chunks[0]);
-
     let search_block = Block::default()
         .title("Search")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
-    f.render_widget(search_block, search_chunk[0]);
+    f.render_widget(search_block, app_container_chunks[0]);
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(50), Constraint::Min(50)].as_ref())
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
         .split(app_container_chunks[1]);
-
-    let status_chunk = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(100)].as_ref())
-        .split(app_container_chunks[2]);
-
-    let status_block = Block::default()
-        .title("Status")
-        .title("Status")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
-    f.render_widget(status_block, status_chunk[0]);
 
     let folders_list_section_block = Block::default()
         .title("Folders")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
     f.render_widget(folders_list_section_block, content_chunks[0]);
+    folders_list_section(f, state, content_chunks[0]);
 
     let models_list_section_block = Block::default()
         .title("Models")
@@ -193,7 +177,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut State) {
         .border_type(BorderType::Rounded);
     f.render_widget(models_list_section_block, content_chunks[1]);
 
-    folders_list_section(f, state, content_chunks[0]);
+    let status_block = Block::default()
+        .title("Status")
+        .title("Status")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(status_block, app_container_chunks[2]);
 
     // delete_popup(f, state);
 }
