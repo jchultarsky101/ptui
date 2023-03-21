@@ -7,7 +7,7 @@ use crossterm::{
 use std::error::Error;
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, BorderType, Borders, List, ListItem, ListState},
@@ -64,13 +64,21 @@ impl State {
         }
     }
 
+    pub fn add_folder(&mut self, folder: Folder) {
+        self.folders.push(folder);
+    }
+
     pub fn change_mode(&mut self, mode: InputMode) {
         self.mode = mode;
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Prepare the state
     let mut state = State::new();
+    state.add_folder(Folder::new(1, String::from("First")));
+    state.add_folder(Folder::new(2, String::from("Second")));
+
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(std::io::stdout());
@@ -123,24 +131,69 @@ fn run_app<B: Backend>(
 }
 
 fn ui<B: Backend>(f: &mut Frame<B>, state: &mut State) {
-    let parent_chunk = Layout::default()
+    let size = f.size();
+
+    // Main container
+    let app_container = Block::default()
+        .title(Span::styled(
+            "Physna TUI",
+            Style::default()
+                .fg(Color::White)
+                //.bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(app_container, size);
+
+    let app_container_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Max(3), Constraint::Min(10), Constraint::Max(3)].as_ref())
+        .split(size);
+
+    let search_chunk = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(100)].as_ref())
+        .split(app_container_chunks[0]);
+
+    let search_block = Block::default()
+        .title("Search")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(search_block, search_chunk[0]);
+
+    let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(f.size());
+        .constraints([Constraint::Min(50), Constraint::Min(50)].as_ref())
+        .split(app_container_chunks[1]);
+
+    let status_chunk = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(100)].as_ref())
+        .split(app_container_chunks[2]);
+
+    let status_block = Block::default()
+        .title("Status")
+        .title("Status")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(status_block, status_chunk[0]);
 
     let folders_list_section_block = Block::default()
         .title("Folders")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
-    f.render_widget(folders_list_section_block, parent_chunk[0]);
-    folders_list_section(f, state, parent_chunk[0]);
+    f.render_widget(folders_list_section_block, content_chunks[0]);
 
-    // let list_section_block = Block::default()
-    //     .title("List of passwords")
-    //     .borders(Borders::ALL)
-    //     .border_type(BorderType::Rounded);
-    // f.render_widget(list_section_block, parent_chunk[1]);
-    // list_section(f, state, parent_chunk[1]);
+    let models_list_section_block = Block::default()
+        .title("Models")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(models_list_section_block, content_chunks[1]);
+
+    folders_list_section(f, state, content_chunks[0]);
 
     // delete_popup(f, state);
 }
@@ -150,12 +203,7 @@ fn folders_list_section<B: Backend>(f: &mut Frame<B>, state: &mut State, area: R
 
     let items: Vec<ListItem> = list_to_show
         .into_iter()
-        .map(|item| match state.mode {
-            InputMode::Normal => {
-                ListItem::new(format!("{}: {}", item.id.to_owned(), item.name.to_owned()))
-            }
-            _ => ListItem::new(Span::from(item.name)),
-        })
+        .map(|item| ListItem::new(format!("{}: {}", item.id.to_owned(), item.name.to_owned())))
         .collect();
 
     let list_chunks = Layout::default()
@@ -168,4 +216,6 @@ fn folders_list_section<B: Backend>(f: &mut Frame<B>, state: &mut State, area: R
         .block(Block::default())
         .highlight_symbol("->")
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+
+    f.render_widget(list, list_chunks[0]);
 }
