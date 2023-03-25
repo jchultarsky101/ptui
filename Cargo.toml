@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 arboard = "3.2.0"
 crossterm = "0.26.1"
+env = "0.0.0"
 log = "0.4.17"
 #ratatui = "0.20.0"
 tui = "0.19.0"

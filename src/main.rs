@@ -18,7 +18,8 @@ use tui_logger::*;
 use uuid::Uuid;
 
 mod text;
-use log::debug;
+use log::{debug, warn};
+use std::env;
 use text::TextField;
 
 const NORMAL_MODE_HELP: &str = r#"
@@ -157,8 +158,24 @@ impl State {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    tui_logger::init_logger(log::LevelFilter::Trace).unwrap();
-    tui_logger::set_default_level(log::LevelFilter::Debug);
+    let log_level = env::var("LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string())
+        .to_lowercase();
+
+    let level_filter = match log_level.as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => {
+            eprintln!("Invalid log level: {}. Defaulting to 'info'", log_level);
+            log::LevelFilter::Info
+        }
+    };
+
+    tui_logger::init_logger(level_filter).unwrap();
+    tui_logger::set_default_level(level_filter);
 
     // Prepare the state
     let state = RefCell::new(State::new());
@@ -219,7 +236,7 @@ fn run_app<B: Backend>(
                         state.change_mode(InputMode::Help);
                     }
                     _ => {
-                        debug!("Unsupported key binding. Displaying the help message in the statusbar.");
+                        warn!("Unsupported key binding. Displaying the help message in the statusbar.");
                         state.status_line = String::from("Press <h> for help or <q> to exit");
                     }
                 },
@@ -356,6 +373,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
                 .border_style(Style::default().fg(Color::White).bg(Color::Black))
                 .borders(Borders::ALL),
         )
+        .style_error(Style::default().fg(Color::Red))
+        .style_debug(Style::default().fg(Color::Green))
+        .style_warn(Style::default().fg(Color::Yellow))
+        .style_trace(Style::default().fg(Color::Magenta))
+        .style_info(Style::default().fg(Color::Cyan))
         .output_separator('|')
         .output_timestamp(Some("%F %H:%M:%S%.3f".to_string()))
         .output_level(Some(TuiLoggerLevelOutput::Long))
@@ -414,7 +436,11 @@ fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
     let state = state.borrow();
     let text = vec![Spans::from(vec![
         Span::styled(
-            format!(" {} ", state.mode),
+            format!("{} ", char::from_u32(0x25B6).unwrap()),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::styled(
+            format!("[{}]", state.mode),
             Style::default().fg(Color::Black).bg(Color::Yellow),
         ),
         Span::styled(
