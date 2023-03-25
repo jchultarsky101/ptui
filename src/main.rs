@@ -1,10 +1,13 @@
-use crossterm::event::Event::Key;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use log::trace;
+use log::{debug, warn};
+use std::env;
 use std::{cell::RefCell, error::Error, fmt};
 use tui::{
     backend::{Backend, CrosstermBackend},
@@ -15,30 +18,51 @@ use tui::{
     Frame, Terminal,
 };
 use tui_logger::*;
+use tui_textarea::{self, Input, TextArea};
 use uuid::Uuid;
 
-mod text;
-use log::{debug, warn};
-use std::env;
-use text::TextField;
-
 const NORMAL_MODE_HELP: &str = r#"
+Normal Mode:
+
 <q>    Exit the program
 <f>    Switch to Folder mode
 <m>    Switch to Model mode
 
-To exit this help, enter <Esc>.
+Press any key to exit this help
 "#;
 
 const SEARCH_MODE_HELP: &str = r#"
-<Esc>        Exit to Normal mode
-<Backspace>  Delete the previous character
-<Enter>      Execute search
+Search Mode:
+
+<Esc>          Exit to Normal mode
+<Backspace>    Delete the character left of the cursor
+<Left Arrow>   Move cursor left
+<Right Arrow>  Move cursor right
+<Home>         Go to beginning of line
+<End>          Go to end of line
+<Delete>       Delete character under cursor
+<Enter>        Execute search
 "#;
 
 const FOLDER_MODE_HELP: &str = r#"
+Folder Mode:
+
 <Esc>    Exit to Normal mode
 <r>      Reload the list of folders
+"#;
+
+const MODEL_MODE_HELP: &str = r#"
+Model Mode:
+
+<Esc>    Exit to Normal mode
+<r>      Reload the list of models
+"#;
+
+const MATCH_MODE_HELP: &str = r#"
+Match Mode:
+
+<Esc>    Exit to Normal mode
+<r>      Regenerate matches
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +80,8 @@ enum HelpType {
     General,
     Search,
     Folder,
+    Model,
+    Match,
 }
 
 impl fmt::Display for InputMode {
@@ -96,27 +122,33 @@ impl Folder {
     }
 }
 
-struct State {
+struct State<'a> {
     mode: InputMode,
     previous_mode: InputMode,
-    search_field: TextField,
+    search_field: TextArea<'a>,
     folders: Vec<Folder>,
     status_line: String,
     help_text: String,
     display_help: bool,
 }
 
-impl State {
-    pub fn new() -> State {
+impl<'a> State<'a> {
+    pub fn new() -> State<'static> {
         State {
             mode: InputMode::Normal,
             previous_mode: InputMode::Normal,
-            search_field: TextField::default(),
+            search_field: TextArea::default(),
             folders: vec![],
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
         }
+    }
+
+    pub fn initialize(&mut self) {
+        self.add_folder(Folder::new(1, String::from("First")));
+        self.add_folder(Folder::new(2, String::from("Second")));
+        self.search_field.set_cursor_line_style(Style::default());
     }
 
     pub fn add_folder(&mut self, folder: Folder) {
@@ -128,7 +160,34 @@ impl State {
         self.status_line.clear();
         self.mode = mode;
 
-        debug!("Change mode from {} to {}", self.previous_mode, self.mode);
+        debug!("Changed mode from {} to {}", self.previous_mode, self.mode);
+
+        match self.mode {
+            InputMode::Normal => {
+                self.status_line = String::from("Press <h> for help or <q> to exit");
+            }
+            InputMode::Search => {
+                self.status_line =
+                    String::from("Press <Esc> to return to Normal mode or <Ctrl-h> for help");
+            }
+            InputMode::Folder => {
+                self.status_line = String::from(
+                    "Press <Esc> to return to Normal mode, <h> for help, or <Tab> for Model mode",
+                );
+            }
+            InputMode::Model => {
+                self.status_line = String::from(
+                    "Press <Esc> to return to Normal mode, <h> for help, or <Tab> for Folder mode",
+                );
+            }
+            InputMode::Match => {
+                self.status_line =
+                    String::from("Press <Esc> to return to Normal mode, <h> for help");
+            }
+            InputMode::Help => {
+                self.status_line = String::from("Press any key to exit the help");
+            }
+        }
     }
 
     pub fn set_help(&mut self, help_type: HelpType) {
@@ -143,6 +202,14 @@ impl State {
             }
             HelpType::Folder => {
                 self.help_text = String::from(FOLDER_MODE_HELP);
+                self.display_help = true;
+            }
+            HelpType::Model => {
+                self.help_text = String::from(MODEL_MODE_HELP);
+                self.display_help = true;
+            }
+            HelpType::Match => {
+                self.help_text = String::from(MATCH_MODE_HELP);
                 self.display_help = true;
             }
         }
@@ -179,12 +246,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Prepare the state
     let state = RefCell::new(State::new());
-    state
-        .borrow_mut()
-        .add_folder(Folder::new(1, String::from("First")));
-    state
-        .borrow_mut()
-        .add_folder(Folder::new(2, String::from("Second")));
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -211,108 +272,191 @@ fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     state: RefCell<State>,
 ) -> Result<(), std::io::Error> {
+    state.borrow_mut().initialize();
+
     loop {
         terminal.draw(|f| ui(f, &state))?;
 
         let mut state = state.borrow_mut();
-        if let Key(key) = event::read()? {
+        if let event = event::read()? {
             match state.mode {
-                InputMode::Normal => match key.code {
-                    KeyCode::Char('q') => {
-                        return Ok(());
-                    }
-                    KeyCode::Char('f') => {
-                        state.change_mode(InputMode::Folder);
-                        state.status_line = String::from("Press <Esc> to return to Normal mode");
-                    }
-                    KeyCode::Char('s') => {
-                        state.change_mode(InputMode::Search);
-                        state.status_line = String::from("Press <Esc> to return to Normal mode");
-                    }
-                    KeyCode::Char('m') => state.change_mode(InputMode::Model),
-                    KeyCode::Char('c') => state.change_mode(InputMode::Match),
-                    KeyCode::Char('h') => {
-                        state.set_help(HelpType::General);
-                        state.change_mode(InputMode::Help);
-                    }
-                    _ => {
-                        warn!("Unsupported key binding. Displaying the help message in the statusbar.");
-                        state.status_line = String::from("Press <h> for help or <q> to exit");
-                    }
-                },
-                InputMode::Search => match key.code {
-                    KeyCode::Esc => {
-                        state.change_mode(InputMode::Normal);
-                    }
-                    KeyCode::Char(c) => {
-                        state.search_field.insert_character(c);
-                    }
-                    KeyCode::Backspace => {
-                        state.search_field.backspace();
-                    }
-                    KeyCode::Left => {
-                        state.search_field.left();
-                    }
-                    KeyCode::Right => {
-                        state.search_field.right();
-                    }
-                    KeyCode::Home => {
-                        state.search_field.home();
-                    }
-                    KeyCode::End => {
-                        state.search_field.end();
-                    }
-                    KeyCode::Delete => {
-                        state.search_field.delete();
-                    }
-                    KeyCode::Enter => {
-                        state.change_mode(InputMode::Normal);
-                        let text = state.search_field.text();
-                        state.status_line = format!("Execute search on \"{}\"", text);
-                        debug!("Executing search on \"{}\"...", text);
-                    }
+                InputMode::Normal => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Char('q'),
+                            ..
+                        } => {
+                            return Ok(());
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('f'),
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Tab, ..
+                        } => {
+                            state.change_mode(InputMode::Folder);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('s'),
+                            ..
+                        } => {
+                            state.change_mode(InputMode::Search);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('m'),
+                            ..
+                        } => state.change_mode(InputMode::Model),
+                        KeyEvent {
+                            code: KeyCode::Char('c'),
+                            ..
+                        } => state.change_mode(InputMode::Match),
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        } => {
+                            state.set_help(HelpType::General);
+                            state.change_mode(InputMode::Help);
+                        }
+                        _ => {
+                            warn!("Unsupported key binding. Press <h> for help");
+                            state.status_line = String::from("Press <h> for help or <q> to exit");
+                        }
+                    },
                     _ => {}
                 },
-                InputMode::Folder => match key.code {
-                    KeyCode::Esc => {
-                        state.change_mode(InputMode::Normal);
-                    }
-                    KeyCode::Char('h') => {
-                        state.set_help(HelpType::Folder);
-                        state.change_mode(InputMode::Help);
-                    }
-                    KeyCode::Up => {
-                        debug!("Select folder one line up");
-                    }
-                    KeyCode::Down => {
-                        debug!("Select folder one line down");
-                    }
-                    KeyCode::Home => {
-                        debug!("Select first folder");
-                    }
-                    KeyCode::End => {
-                        debug!("Select last folder");
-                    }
+                InputMode::Search => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => state.change_mode(InputMode::Normal),
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => {
+                            let text = state.search_field.lines()[0].clone();
+                            debug!("Search for \"{}\"", text);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            state.set_help(HelpType::Search);
+                            state.change_mode(InputMode::Help);
+                        }
+                        input => {
+                            let input: Input = Input {
+                                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                                alt: key.modifiers.contains(KeyModifiers::ALT),
+                                key: match key.code {
+                                    KeyCode::Char(c) => tui_textarea::Key::Char(c),
+                                    KeyCode::Backspace => tui_textarea::Key::Backspace,
+                                    KeyCode::Enter => tui_textarea::Key::Enter,
+                                    KeyCode::Left => tui_textarea::Key::Left,
+                                    KeyCode::Right => tui_textarea::Key::Right,
+                                    KeyCode::Up => tui_textarea::Key::Up,
+                                    KeyCode::Down => tui_textarea::Key::Down,
+                                    KeyCode::Tab => tui_textarea::Key::Tab,
+                                    KeyCode::Delete => tui_textarea::Key::Delete,
+                                    KeyCode::Home => tui_textarea::Key::Home,
+                                    KeyCode::End => tui_textarea::Key::End,
+                                    KeyCode::PageUp => tui_textarea::Key::PageUp,
+                                    KeyCode::PageDown => tui_textarea::Key::PageDown,
+                                    KeyCode::Esc => tui_textarea::Key::Esc,
+                                    KeyCode::F(x) => tui_textarea::Key::F(x),
+                                    _ => tui_textarea::Key::Null,
+                                },
+                            };
+                            state.search_field.input(input);
+                        }
+                    },
                     _ => {}
                 },
-                InputMode::Model => match key.code {
-                    KeyCode::Esc => {
-                        state.change_mode(InputMode::Normal);
-                    }
+                InputMode::Folder => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => state.change_mode(InputMode::Normal),
+                        KeyEvent {
+                            code: KeyCode::Tab, ..
+                        } => state.change_mode(InputMode::Model),
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        } => {
+                            state.set_help(HelpType::Folder);
+                            state.change_mode(InputMode::Help);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Up, ..
+                        } => {
+                            debug!("Select folder one line up");
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        } => {
+                            debug!("Select folder one line down");
+                        }
+                        KeyEvent {
+                            code: KeyCode::Home,
+                            ..
+                        } => {
+                            debug!("Select first folder");
+                        }
+                        KeyEvent {
+                            code: KeyCode::End, ..
+                        } => {
+                            debug!("Select last folder");
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 },
-                InputMode::Match => match key.code {
-                    KeyCode::Esc => {
-                        state.change_mode(InputMode::Normal);
-                    }
+                InputMode::Model => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => state.change_mode(InputMode::Normal),
+                        KeyEvent {
+                            code: KeyCode::Tab, ..
+                        } => state.change_mode(InputMode::Folder),
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        } => {
+                            state.set_help(HelpType::Model);
+                            state.change_mode(InputMode::Help);
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 },
-                InputMode::Help => match key.code {
-                    KeyCode::Esc => {
-                        let previous_mode = state.previous_mode;
-                        state.hide_help();
-                        state.change_mode(previous_mode);
-                    }
+                InputMode::Match => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => state.change_mode(InputMode::Normal),
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        } => {
+                            state.set_help(HelpType::Match);
+                            state.change_mode(InputMode::Help);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                },
+                InputMode::Help => match event {
+                    Event::Key(key) => match key {
+                        _ => {
+                            let previous_mode = state.previous_mode;
+                            state.hide_help();
+                            state.change_mode(previous_mode);
+                        }
+                    },
                     _ => {}
                 },
             }
@@ -363,7 +507,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     let models_list_section_block = Block::default()
         .title("Models")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .style(match state.borrow().mode {
+            InputMode::Model => Style::default().fg(Color::Yellow),
+            _ => Style::default(),
+        });
     f.render_widget(models_list_section_block, content_chunks[1]);
 
     let tui_w: TuiLoggerWidget = TuiLoggerWidget::default()
@@ -392,7 +540,6 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     status_section(f, state, container_chunks[3]);
 
     help_section(f, state);
-    // delete_popup(f, state);
 }
 
 fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
@@ -458,7 +605,9 @@ fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
 }
 
 fn search_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let state = state.borrow();
+    let mut state = state.borrow_mut();
+
+    state.search_field.set_style(Style::default());
     let search_block = Block::default()
         .title("Search")
         .borders(Borders::ALL)
@@ -469,25 +618,13 @@ fn search_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
         });
     f.render_widget(search_block.clone(), area);
 
-    let search = Paragraph::new(state.search_field.text()).style(match state.mode {
-        InputMode::Search => Style::default().fg(Color::Yellow),
-        _ => Style::default(),
-    });
-
     let margin = Margin {
         horizontal: 2,
         vertical: 1,
     };
 
     let edit_area = area.inner(&margin);
-    f.render_widget(search, edit_area);
-
-    match state.mode {
-        InputMode::Search => {
-            f.set_cursor(edit_area.x + state.search_field.index() as u16, edit_area.y);
-        }
-        _ => {}
-    }
+    f.render_widget(state.search_field.widget(), edit_area);
 }
 
 /// helper function to create a centered rect using up certain percentage of the available rect `r`
