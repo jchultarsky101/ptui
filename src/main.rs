@@ -8,13 +8,13 @@ use crossterm::{
 use log::trace;
 use log::{debug, warn};
 use std::env;
-use std::{cell::RefCell, error::Error, fmt};
+use std::{cell::RefCell, error::Error, fmt, io::ErrorKind};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tui_logger::*;
@@ -126,7 +126,7 @@ struct State<'a> {
     mode: InputMode,
     previous_mode: InputMode,
     search_field: TextArea<'a>,
-    folders: Vec<Folder>,
+    folder_list: StatefulList<String>,
     status_line: String,
     help_text: String,
     display_help: bool,
@@ -138,7 +138,7 @@ impl<'a> State<'a> {
             mode: InputMode::Normal,
             previous_mode: InputMode::Normal,
             search_field: TextArea::default(),
-            folders: vec![],
+            folder_list: StatefulList::with_items(vec![]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
@@ -148,11 +148,14 @@ impl<'a> State<'a> {
     pub fn initialize(&mut self) {
         self.add_folder(Folder::new(1, String::from("First")));
         self.add_folder(Folder::new(2, String::from("Second")));
+        self.add_folder(Folder::new(2, String::from("Third")));
+        self.add_folder(Folder::new(2, String::from("Fourth")));
+        self.add_folder(Folder::new(2, String::from("Fifth")));
         self.search_field.set_cursor_line_style(Style::default());
     }
 
     pub fn add_folder(&mut self, folder: Folder) {
-        self.folders.push(folder);
+        self.folder_list.items.push(folder.name);
     }
 
     pub fn change_mode(&mut self, mode: InputMode) {
@@ -221,6 +224,64 @@ impl<'a> State<'a> {
 
     pub fn show_help(&self) -> bool {
         self.display_help
+    }
+}
+
+struct StatefulList<T> {
+    state: ListState,
+    items: Vec<T>,
+}
+
+impl<T> StatefulList<T> {
+    fn with_items(items: Vec<T>) -> StatefulList<T> {
+        StatefulList {
+            state: ListState::default(),
+            items,
+        }
+    }
+
+    fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn first(&mut self) {
+        self.state.select(Some(0));
+    }
+
+    fn last(&mut self) {
+        if self.items.is_empty() {
+            self.first();
+        } else {
+            self.state.select(Some(self.items.len() - 1));
+        }
+    }
+
+    fn unselect(&mut self) {
+        self.state.select(None);
     }
 }
 
@@ -391,24 +452,46 @@ fn run_app<B: Backend>(
                         KeyEvent {
                             code: KeyCode::Up, ..
                         } => {
-                            debug!("Select folder one line up");
+                            state.folder_list.previous();
                         }
                         KeyEvent {
                             code: KeyCode::Down,
                             ..
                         } => {
-                            debug!("Select folder one line down");
+                            state.folder_list.next();
                         }
                         KeyEvent {
                             code: KeyCode::Home,
                             ..
                         } => {
-                            debug!("Select first folder");
+                            state.folder_list.first();
                         }
                         KeyEvent {
                             code: KeyCode::End, ..
                         } => {
-                            debug!("Select last folder");
+                            state.folder_list.last();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => {
+                            let selected = state.folder_list.state.selected();
+                            match selected {
+                                Some(index) => {
+                                    let selected_item =
+                                        state.folder_list.items.get(index).ok_or(Err::<
+                                            String,
+                                            std::io::Error,
+                                        >(
+                                            std::io::Error::new(
+                                                ErrorKind::Other,
+                                                "Incompatible folder list item",
+                                            ),
+                                        ));
+                                    debug!("Selected folder \"{}\"", selected_item.unwrap());
+                                }
+                                None => warn!("No folder selected"),
+                            }
                         }
                         _ => {}
                     },
@@ -543,13 +626,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
 }
 
 fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let state = state.borrow();
-    let list_to_show = state.folders.clone();
-
-    let items: Vec<ListItem> = list_to_show
-        .into_iter()
-        .map(|item| ListItem::new(format!("{}: {}", item.id.to_owned(), item.name.to_owned())))
-        .collect();
+    let mut state = state.borrow_mut();
 
     let folder_list_chunk = Layout::default()
         .margin(2)
@@ -567,23 +644,36 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
         });
     f.render_widget(folders_list_section_block, area);
 
-    let list_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
-        .split(folder_list_chunk[0]);
+    let visible_items: Vec<ListItem> = state
+        .folder_list
+        .items
+        .iter()
+        .cloned()
+        .map(|i| ListItem::new(i))
+        .collect();
 
-    let list = List::new(items)
-        .highlight_symbol("->")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
+    let folder_list = List::new(visible_items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(selection_indicator.as_str());
 
-    f.render_widget(list, list_chunks[0]);
+    f.render_stateful_widget(
+        folder_list,
+        folder_list_chunk[0],
+        &mut state.folder_list.state,
+    );
 }
 
 fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
     let state = state.borrow();
     let text = vec![Spans::from(vec![
         Span::styled(
-            format!("{} ", char::from_u32(0x25B6).unwrap()),
+            format!(" {} ", char::from_u32(0x25B6).unwrap()),
             Style::default().fg(Color::Blue),
         ),
         Span::styled(
