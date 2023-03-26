@@ -28,6 +28,7 @@ const NORMAL_MODE_HELP: &str = r#"
 Normal Mode:
 
 <q>    Exit the program
+<t>    Select Physna tenant
 <f>    Switch to Folder mode
 <m>    Switch to Model mode
 
@@ -68,6 +69,13 @@ Match Mode:
 <r>      Regenerate matches
 "#;
 
+const TENANT_MODE_HELP: &str = r#"
+Tenant Mode:
+
+<Esc>    Exit to Normal mode
+<r>      Regenerate matches
+"#;
+
 #[derive(Debug, Clone, Copy)]
 enum InputMode {
     Normal,
@@ -76,6 +84,7 @@ enum InputMode {
     Model,
     Match,
     Help,
+    Tenant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +94,7 @@ enum HelpType {
     Folder,
     Model,
     Match,
+    Tenant,
 }
 
 impl fmt::Display for InputMode {
@@ -96,6 +106,7 @@ impl fmt::Display for InputMode {
             InputMode::Model => write!(f, "Model "),
             InputMode::Match => write!(f, "Match "),
             InputMode::Help => write!(f, "Help  "),
+            InputMode::Tenant => write!(f, "Tenant"),
         }
     }
 }
@@ -134,23 +145,33 @@ struct State<'a> {
     status_line: String,
     help_text: String,
     display_help: bool,
+    display_tenants: bool,
+    tenants: StatefulList<String>,
+    active_tenant: Option<String>,
 }
 
 impl<'a> State<'a> {
     pub fn new() -> State<'static> {
         State {
-            mode: InputMode::Normal,
-            previous_mode: InputMode::Normal,
+            mode: InputMode::Tenant,
+            previous_mode: InputMode::Tenant,
             search_field: TextArea::default(),
             folder_list: StatefulList::default(), //with_items(vec![]),
             models_table: StatefulTable::with_columns(vec!["UUID", "Name", "Status"]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
+            display_tenants: true,
+            tenants: StatefulList::default(),
+            active_tenant: None,
         }
     }
 
     pub fn initialize(&mut self) {
+        self.tenants.items.push(String::from("First Tenant"));
+        self.tenants.items.push(String::from("Seconf Tenant"));
+        self.tenants.items.push(String::from("Third Tenant"));
+
         self.add_folder(Folder::new(1, String::from("First")));
         self.add_folder(Folder::new(2, String::from("Second")));
         self.add_folder(Folder::new(2, String::from("Third")));
@@ -212,6 +233,11 @@ impl<'a> State<'a> {
             InputMode::Help => {
                 self.status_line = String::from("Press any key to exit the help");
             }
+            InputMode::Tenant => {
+                self.status_line = String::from(
+                    "Select and press <Enter> to specify a tenant, or press <Esc> to cancel",
+                )
+            }
         }
     }
 
@@ -237,6 +263,10 @@ impl<'a> State<'a> {
                 self.help_text = String::from(MATCH_MODE_HELP);
                 self.display_help = true;
             }
+            HelpType::Tenant => {
+                self.help_text = String::from(TENANT_MODE_HELP);
+                self.display_help = true;
+            }
         }
     }
 
@@ -246,6 +276,10 @@ impl<'a> State<'a> {
 
     pub fn show_help(&self) -> bool {
         self.display_help
+    }
+
+    pub fn show_tenant(&self) -> bool {
+        self.display_tenants
     }
 }
 
@@ -463,6 +497,13 @@ fn run_app<B: Backend>(
                             state.set_help(HelpType::General);
                             state.change_mode(InputMode::Help);
                         }
+                        KeyEvent {
+                            code: KeyCode::Char('t'),
+                            ..
+                        } => {
+                            state.display_tenants = true;
+                            state.change_mode(InputMode::Tenant);
+                        }
                         _ => {
                             warn!("Unsupported key binding. Press <h> for help");
                             state.status_line = String::from("Press <h> for help or <q> to exit");
@@ -659,23 +700,117 @@ fn run_app<B: Backend>(
                     },
                     _ => {}
                 },
+                InputMode::Tenant => match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => {
+                            state.display_tenants = false;
+                            state.change_mode(InputMode::Normal)
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            ..
+                        } => {
+                            state.set_help(HelpType::Tenant);
+                            state.change_mode(InputMode::Help);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Up, ..
+                        } => {
+                            state.tenants.previous();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        } => {
+                            state.tenants.next();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Home,
+                            ..
+                        } => {
+                            state.tenants.first();
+                        }
+                        KeyEvent {
+                            code: KeyCode::End, ..
+                        } => {
+                            state.tenants.last();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => {
+                            let selected = state.tenants.state.selected();
+                            match selected {
+                                Some(index) => {
+                                    let selected_item =
+                                        state.tenants.items.get(index).ok_or(Err::<
+                                            String,
+                                            std::io::Error,
+                                        >(
+                                            std::io::Error::new(
+                                                ErrorKind::Other,
+                                                "Incompatible tenant list item",
+                                            ),
+                                        ));
+
+                                    let active_tenant = selected_item.unwrap().to_owned();
+                                    state.active_tenant = Some(active_tenant.clone());
+                                    debug!("Selected tenant \"{}\"", active_tenant.clone());
+
+                                    state.display_tenants = false;
+                                    state.change_mode(InputMode::Normal);
+                                }
+                                None => {
+                                    state.active_tenant = None;
+                                    warn!("No tenant selected");
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                },
             }
         };
     }
 }
 
+fn tenant_selection_ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {}
+
 fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     let size = f.size();
 
+    let active_tenant = state
+        .borrow()
+        .active_tenant
+        .as_ref()
+        .unwrap_or(&String::from("None"))
+        .to_owned();
+
     // Main container
     let app_container = Block::default()
-        .title(Span::styled(
-            "Physna TUI",
-            Style::default()
-                .fg(Color::White)
-                //.bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(Spans::from(vec![
+            Span::styled(
+                "Physna TUI (",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                active_tenant,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ")",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
@@ -740,6 +875,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     let status_block = Block::default().borders(Borders::NONE);
     f.render_widget(status_block, container_chunks[3]);
     status_section(f, state, container_chunks[3]);
+
+    tenant_selection_section(f, state);
 
     help_section(f, state);
 }
@@ -878,6 +1015,52 @@ fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
             vertical: 1,
         };
         f.render_widget(text, area.inner(&margin));
+    }
+}
+
+fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
+    let mut state = state.borrow_mut();
+
+    if state.display_tenants {
+        let block = Block::default().title("Tenant").borders(Borders::ALL);
+        let area = centered_rect(30, 50, f.size());
+        f.render_widget(Clear, area); //this clears out the background
+        f.render_widget(block, area);
+
+        let margin = Margin {
+            horizontal: 2,
+            vertical: 2,
+        };
+
+        let tenant_list_section_block = Block::default()
+            .title("Folders")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(match state.mode {
+                InputMode::Tenant => Style::default().fg(Color::Yellow),
+                _ => Style::default(),
+            });
+        f.render_widget(tenant_list_section_block, area);
+
+        let visible_items: Vec<ListItem> = state
+            .tenants
+            .items
+            .iter()
+            .cloned()
+            .map(|i| ListItem::new(i))
+            .collect();
+
+        let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
+        let tenants_list = List::new(visible_items)
+            .highlight_style(
+                Style::default().add_modifier(Modifier::REVERSED),
+                // .fg(Color::Black)
+                // .bg(Color::LightBlue)
+                // .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(selection_indicator.as_str());
+
+        f.render_stateful_widget(tenants_list, area.inner(&margin), &mut state.tenants.state);
     }
 }
 
