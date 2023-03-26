@@ -5,10 +5,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use log::trace;
+use dirs::home_dir;
+use exitcode;
 use log::{debug, warn};
+use pcli::configuration::ClientConfiguration;
 use std::env;
-use std::{cell::RefCell, error::Error, fmt, io::ErrorKind};
+use std::{cell::RefCell, error::Error, fmt};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -22,7 +24,6 @@ use tui::{
 };
 use tui_logger::*;
 use tui_textarea::{self, Input, TextArea};
-use uuid::Uuid;
 
 const NORMAL_MODE_HELP: &str = r#"
 Normal Mode:
@@ -111,19 +112,6 @@ impl fmt::Display for InputMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ModelState {
-    Received,
-    Indexing,
-    Ready,
-}
-
-struct Model {
-    id: Uuid,
-    name: String,
-    state: ModelState,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct Folder {
     id: usize,
@@ -148,10 +136,11 @@ struct State<'a> {
     display_tenants: bool,
     tenants: StatefulList<String>,
     active_tenant: Option<String>,
+    configuration: ClientConfiguration,
 }
 
 impl<'a> State<'a> {
-    pub fn new() -> State<'static> {
+    pub fn new(configuration: ClientConfiguration) -> State<'static> {
         State {
             mode: InputMode::Tenant,
             previous_mode: InputMode::Tenant,
@@ -164,13 +153,16 @@ impl<'a> State<'a> {
             display_tenants: true,
             tenants: StatefulList::default(),
             active_tenant: None,
+            configuration,
         }
     }
 
     pub fn initialize(&mut self) {
-        self.tenants.items.push(String::from("First Tenant"));
-        self.tenants.items.push(String::from("Seconf Tenant"));
-        self.tenants.items.push(String::from("Third Tenant"));
+        self.configuration
+            .tenants
+            .keys()
+            .clone()
+            .for_each(|k| self.tenants.items.push(k.to_owned()));
 
         self.add_folder(Folder::new(1, String::from("First")));
         self.add_folder(Folder::new(2, String::from("Second")));
@@ -277,10 +269,6 @@ impl<'a> State<'a> {
     pub fn show_help(&self) -> bool {
         self.display_help
     }
-
-    pub fn show_tenant(&self) -> bool {
-        self.display_tenants
-    }
 }
 
 struct StatefulList<T> {
@@ -335,10 +323,6 @@ impl<T> StatefulList<T> {
             self.state.select(Some(self.items.len() - 1));
         }
     }
-
-    fn unselect(&mut self) {
-        self.state.select(None);
-    }
 }
 
 impl<T> Default for StatefulList<T> {
@@ -364,14 +348,6 @@ impl<'a, T> StatefulTable<'a, T> {
 
     fn add_row(&mut self, row: Vec<T>) {
         self.rows.push(row);
-    }
-
-    fn row(&self, index: usize) -> Option<&Vec<T>> {
-        self.rows.get(index)
-    }
-
-    fn delete_row(&mut self, index: usize) {
-        self.rows.remove(index);
     }
 
     pub fn next(&mut self) {
@@ -420,11 +396,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let home_directory = home_dir();
+    let home_directory = match home_directory {
+        Some(dir) => dir,
+        None => {
+            eprintln!("Error: Failed to determine the home directory");
+            ::std::process::exit(exitcode::DATAERR);
+        }
+    };
+    let home_directory = String::from(home_directory.to_str().unwrap());
+    let mut default_configuration_file_path = home_directory;
+    default_configuration_file_path.push_str("/.pcli.conf");
+
+    let configuration =
+        pcli::configuration::initialize(&String::from(default_configuration_file_path));
+    let configuration = match configuration {
+        Ok(configuration) => configuration,
+        Err(e) => {
+            eprintln!(
+                "Cannot initialize process with the provided configuration: {}",
+                e
+            );
+            ::std::process::exit(exitcode::CONFIG);
+        }
+    };
+
     tui_logger::init_logger(level_filter).unwrap();
     tui_logger::set_default_level(level_filter);
 
     // Prepare the state
-    let state = RefCell::new(State::new());
+    let state = RefCell::new(State::new(configuration));
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -457,327 +458,322 @@ fn run_app<B: Backend>(
         terminal.draw(|f| ui(f, &state))?;
 
         let mut state = state.borrow_mut();
-        if let event = event::read()? {
-            match state.mode {
-                InputMode::Normal => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Char('q'),
-                            ..
-                        } => {
-                            return Ok(());
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('f'),
-                            ..
-                        }
-                        | KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => {
-                            state.change_mode(InputMode::Folder);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('s'),
-                            ..
-                        } => {
-                            state.change_mode(InputMode::Search);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('m'),
-                            ..
-                        } => state.change_mode(InputMode::Model),
-                        KeyEvent {
-                            code: KeyCode::Char('c'),
-                            ..
-                        } => state.change_mode(InputMode::Match),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::General);
-                            state.change_mode(InputMode::Help);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('t'),
-                            ..
-                        } => {
-                            state.display_tenants = true;
-                            state.change_mode(InputMode::Tenant);
-                        }
-                        _ => {
-                            warn!("Unsupported key binding. Press <h> for help");
-                            state.status_line = String::from("Press <h> for help or <q> to exit");
-                        }
-                    },
-                    _ => {}
+        let event = event::read()?;
+        match state.mode {
+            InputMode::Normal => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Char('q'),
+                        ..
+                    } => {
+                        return Ok(());
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('f'),
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => {
+                        state.change_mode(InputMode::Folder);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } => {
+                        state.change_mode(InputMode::Search);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('m'),
+                        ..
+                    } => state.change_mode(InputMode::Model),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        ..
+                    } => state.change_mode(InputMode::Match),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::General);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        ..
+                    } => {
+                        state.display_tenants = true;
+                        state.change_mode(InputMode::Tenant);
+                    }
+                    _ => {
+                        warn!("Unsupported key binding. Press <h> for help");
+                        state.status_line = String::from("Press <h> for help or <q> to exit");
+                    }
                 },
-                InputMode::Search => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let text = state.search_field.lines()[0].clone();
-                            debug!("Search for \"{}\"", text);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            modifiers: KeyModifiers::CONTROL,
-                            ..
-                        } => {
-                            state.set_help(HelpType::Search);
-                            state.change_mode(InputMode::Help);
-                        }
-                        input => {
-                            let input: Input = Input {
-                                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-                                alt: key.modifiers.contains(KeyModifiers::ALT),
-                                key: match key.code {
-                                    KeyCode::Char(c) => tui_textarea::Key::Char(c),
-                                    KeyCode::Backspace => tui_textarea::Key::Backspace,
-                                    KeyCode::Enter => tui_textarea::Key::Enter,
-                                    KeyCode::Left => tui_textarea::Key::Left,
-                                    KeyCode::Right => tui_textarea::Key::Right,
-                                    KeyCode::Up => tui_textarea::Key::Up,
-                                    KeyCode::Down => tui_textarea::Key::Down,
-                                    KeyCode::Tab => tui_textarea::Key::Tab,
-                                    KeyCode::Delete => tui_textarea::Key::Delete,
-                                    KeyCode::Home => tui_textarea::Key::Home,
-                                    KeyCode::End => tui_textarea::Key::End,
-                                    KeyCode::PageUp => tui_textarea::Key::PageUp,
-                                    KeyCode::PageDown => tui_textarea::Key::PageDown,
-                                    KeyCode::Esc => tui_textarea::Key::Esc,
-                                    KeyCode::F(x) => tui_textarea::Key::F(x),
-                                    _ => tui_textarea::Key::Null,
-                                },
-                            };
-                            state.search_field.input(input);
-                        }
-                    },
-                    _ => {}
+                _ => {}
+            },
+            InputMode::Search => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let text = state.search_field.lines()[0].clone();
+                        debug!("Search for \"{}\"", text);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => {
+                        state.set_help(HelpType::Search);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {
+                        let input: Input = Input {
+                            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                            alt: key.modifiers.contains(KeyModifiers::ALT),
+                            key: match key.code {
+                                KeyCode::Char(c) => tui_textarea::Key::Char(c),
+                                KeyCode::Backspace => tui_textarea::Key::Backspace,
+                                KeyCode::Enter => tui_textarea::Key::Enter,
+                                KeyCode::Left => tui_textarea::Key::Left,
+                                KeyCode::Right => tui_textarea::Key::Right,
+                                KeyCode::Up => tui_textarea::Key::Up,
+                                KeyCode::Down => tui_textarea::Key::Down,
+                                KeyCode::Tab => tui_textarea::Key::Tab,
+                                KeyCode::Delete => tui_textarea::Key::Delete,
+                                KeyCode::Home => tui_textarea::Key::Home,
+                                KeyCode::End => tui_textarea::Key::End,
+                                KeyCode::PageUp => tui_textarea::Key::PageUp,
+                                KeyCode::PageDown => tui_textarea::Key::PageDown,
+                                KeyCode::Esc => tui_textarea::Key::Esc,
+                                KeyCode::F(x) => tui_textarea::Key::F(x),
+                                _ => tui_textarea::Key::Null,
+                            },
+                        };
+                        state.search_field.input(input);
+                    }
                 },
-                InputMode::Folder => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => state.change_mode(InputMode::Model),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Folder);
-                            state.change_mode(InputMode::Help);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Up, ..
-                        } => {
-                            state.folder_list.previous();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        } => {
-                            state.folder_list.next();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Home,
-                            ..
-                        } => {
-                            state.folder_list.first();
-                        }
-                        KeyEvent {
-                            code: KeyCode::End, ..
-                        } => {
-                            state.folder_list.last();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let selected = state.folder_list.state.selected();
-                            match selected {
-                                Some(index) => {
-                                    let selected_item =
-                                        state.folder_list.items.get(index).ok_or(Err::<
-                                            String,
-                                            std::io::Error,
-                                        >(
-                                            std::io::Error::new(
-                                                ErrorKind::Other,
-                                                "Incompatible folder list item",
-                                            ),
-                                        ));
-                                    debug!("Selected folder \"{}\"", selected_item.unwrap());
-                                }
-                                None => warn!("No folder selected"),
+                _ => {}
+            },
+            InputMode::Folder => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => state.change_mode(InputMode::Model),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Folder);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.folder_list.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.folder_list.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.folder_list.first();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.folder_list.last();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.folder_list.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_item =
+                                    state.folder_list.items.get(index).ok_or(Err::<
+                                        String,
+                                        std::io::Error,
+                                    >(
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            "Incompatible folder list item",
+                                        ),
+                                    ));
+                                debug!("Selected folder \"{}\"", selected_item.unwrap());
                             }
+                            None => warn!("No folder selected"),
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 },
-                InputMode::Model => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => state.change_mode(InputMode::Folder),
-                        KeyEvent {
-                            code: KeyCode::Up, ..
-                        } => {
-                            state.models_table.previous();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        } => {
-                            state.models_table.next();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let selected = state.models_table.state.selected();
-                            match selected {
-                                Some(index) => {
-                                    let selected_row =
-                                        state.models_table.rows.get(index).ok_or(Err::<
-                                            String,
-                                            std::io::Error,
-                                        >(
-                                            std::io::Error::new(
-                                                ErrorKind::Other,
-                                                "Incompatible model row item",
-                                            ),
-                                        ));
-                                    debug!("Selected model \"{}\"", selected_row.unwrap()[0]);
-                                }
-                                None => warn!("No model selected"),
+                _ => {}
+            },
+            InputMode::Model => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => state.change_mode(InputMode::Folder),
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.models_table.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.models_table.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.models_table.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_row = state.models_table.rows.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible model row item",
+                                    ),
+                                ));
+                                debug!("Selected model \"{}\"", selected_row.unwrap()[0]);
                             }
+                            None => warn!("No model selected"),
                         }
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Model);
-                            state.change_mode(InputMode::Help);
-                        }
-                        _ => {}
-                    },
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Model);
+                        state.change_mode(InputMode::Help);
+                    }
                     _ => {}
                 },
-                InputMode::Match => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Match);
-                            state.change_mode(InputMode::Help);
-                        }
-                        _ => {}
-                    },
+                _ => {}
+            },
+            InputMode::Match => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Match);
+                        state.change_mode(InputMode::Help);
+                    }
                     _ => {}
                 },
-                InputMode::Help => match event {
-                    Event::Key(key) => match key {
-                        _ => {
-                            let previous_mode = state.previous_mode;
-                            state.hide_help();
-                            state.change_mode(previous_mode);
-                        }
-                    },
-                    _ => {}
+                _ => {}
+            },
+            InputMode::Help => match event {
+                Event::Key(key) => match key {
+                    _ => {
+                        let previous_mode = state.previous_mode;
+                        state.hide_help();
+                        state.change_mode(previous_mode);
+                    }
                 },
-                InputMode::Tenant => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => {
-                            state.display_tenants = false;
-                            state.change_mode(InputMode::Normal)
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Tenant);
-                            state.change_mode(InputMode::Help);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Up, ..
-                        } => {
-                            state.tenants.previous();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        } => {
-                            state.tenants.next();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Home,
-                            ..
-                        } => {
-                            state.tenants.first();
-                        }
-                        KeyEvent {
-                            code: KeyCode::End, ..
-                        } => {
-                            state.tenants.last();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let selected = state.tenants.state.selected();
-                            match selected {
-                                Some(index) => {
-                                    let selected_item =
-                                        state.tenants.items.get(index).ok_or(Err::<
-                                            String,
-                                            std::io::Error,
-                                        >(
-                                            std::io::Error::new(
-                                                ErrorKind::Other,
-                                                "Incompatible tenant list item",
-                                            ),
-                                        ));
+                _ => {}
+            },
+            InputMode::Tenant => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => {
+                        state.display_tenants = false;
+                        state.change_mode(InputMode::Normal)
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Tenant);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.tenants.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.tenants.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.tenants.first();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.tenants.last();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.tenants.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_item = state.tenants.items.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible tenant list item",
+                                    ),
+                                ));
 
-                                    let active_tenant = selected_item.unwrap().to_owned();
-                                    state.active_tenant = Some(active_tenant.clone());
-                                    debug!("Selected tenant \"{}\"", active_tenant.clone());
+                                let active_tenant = selected_item.unwrap().to_owned();
+                                state.active_tenant = Some(active_tenant.clone());
+                                debug!("Selected tenant \"{}\"", active_tenant.clone());
 
-                                    state.display_tenants = false;
-                                    state.change_mode(InputMode::Normal);
-                                }
-                                None => {
-                                    state.active_tenant = None;
-                                    warn!("No tenant selected");
-                                }
+                                state.display_tenants = false;
+                                state.change_mode(InputMode::Normal);
+                            }
+                            None => {
+                                state.active_tenant = None;
+                                warn!("No tenant selected");
                             }
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 },
-            }
-        };
+                _ => {}
+            },
+        }
     }
 }
-
-fn tenant_selection_ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {}
 
 fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     let size = f.size();
@@ -1066,11 +1062,6 @@ fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>
 
 fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
     let mut state = state.borrow_mut();
-
-    let rects = Layout::default()
-        .constraints([Constraint::Percentage(100)].as_ref())
-        .margin(5)
-        .split(f.size());
 
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let normal_style = Style::default().bg(Color::White);
