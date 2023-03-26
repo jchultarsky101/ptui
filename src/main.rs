@@ -14,7 +14,10 @@ use tui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
+        TableState, Wrap,
+    },
     Frame, Terminal,
 };
 use tui_logger::*;
@@ -127,6 +130,7 @@ struct State<'a> {
     previous_mode: InputMode,
     search_field: TextArea<'a>,
     folder_list: StatefulList<String>,
+    models_table: StatefulTable<'a, String>,
     status_line: String,
     help_text: String,
     display_help: bool,
@@ -138,7 +142,8 @@ impl<'a> State<'a> {
             mode: InputMode::Normal,
             previous_mode: InputMode::Normal,
             search_field: TextArea::default(),
-            folder_list: StatefulList::with_items(vec![]),
+            folder_list: StatefulList::default(), //with_items(vec![]),
+            models_table: StatefulTable::with_columns(vec!["UUID", "Name", "Status"]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
@@ -151,7 +156,24 @@ impl<'a> State<'a> {
         self.add_folder(Folder::new(2, String::from("Third")));
         self.add_folder(Folder::new(2, String::from("Fourth")));
         self.add_folder(Folder::new(2, String::from("Fifth")));
+
         self.search_field.set_cursor_line_style(Style::default());
+
+        self.models_table.add_row(vec![
+            String::from("UUID_1"),
+            String::from("Name_1"),
+            String::from("Status_1"),
+        ]);
+        self.models_table.add_row(vec![
+            String::from("UUID_2"),
+            String::from("Name_2"),
+            String::from("Status_2"),
+        ]);
+        self.models_table.add_row(vec![
+            String::from("UUID_3"),
+            String::from("Name_3"),
+            String::from("Status_3"),
+        ]);
     }
 
     pub fn add_folder(&mut self, folder: Folder) {
@@ -282,6 +304,68 @@ impl<T> StatefulList<T> {
 
     fn unselect(&mut self) {
         self.state.select(None);
+    }
+}
+
+impl<T> Default for StatefulList<T> {
+    fn default() -> StatefulList<T> {
+        Self::with_items(vec![])
+    }
+}
+
+struct StatefulTable<'a, T> {
+    state: TableState,
+    columns: Vec<&'a str>,
+    rows: Vec<Vec<T>>,
+}
+
+impl<'a, T> StatefulTable<'a, T> {
+    fn with_columns(columns: Vec<&'a str>) -> StatefulTable<'a, T> {
+        StatefulTable {
+            state: TableState::default(),
+            columns,
+            rows: vec![],
+        }
+    }
+
+    fn add_row(&mut self, row: Vec<T>) {
+        self.rows.push(row);
+    }
+
+    fn row(&self, index: usize) -> Option<&Vec<T>> {
+        self.rows.get(index)
+    }
+
+    fn delete_row(&mut self, index: usize) {
+        self.rows.remove(index);
+    }
+
+    pub fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i >= self.rows.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.rows.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
     }
 }
 
@@ -506,6 +590,39 @@ fn run_app<B: Backend>(
                             code: KeyCode::Tab, ..
                         } => state.change_mode(InputMode::Folder),
                         KeyEvent {
+                            code: KeyCode::Up, ..
+                        } => {
+                            state.models_table.previous();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        } => {
+                            state.models_table.next();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => {
+                            let selected = state.models_table.state.selected();
+                            match selected {
+                                Some(index) => {
+                                    let selected_row =
+                                        state.models_table.rows.get(index).ok_or(Err::<
+                                            String,
+                                            std::io::Error,
+                                        >(
+                                            std::io::Error::new(
+                                                ErrorKind::Other,
+                                                "Incompatible model row item",
+                                            ),
+                                        ));
+                                    debug!("Selected model \"{}\"", selected_row.unwrap()[0]);
+                                }
+                                None => warn!("No model selected"),
+                            }
+                        }
+                        KeyEvent {
                             code: KeyCode::Char('h'),
                             ..
                         } => {
@@ -597,6 +714,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
         });
     f.render_widget(models_list_section_block, content_chunks[1]);
 
+    models_section(f, state, content_chunks[1]);
+
     let tui_w: TuiLoggerWidget = TuiLoggerWidget::default()
         .block(
             Block::default()
@@ -655,10 +774,10 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
     let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
     let folder_list = List::new(visible_items)
         .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::REVERSED),
+            // .fg(Color::Black)
+            // .bg(Color::LightBlue)
+            // .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(selection_indicator.as_str());
 
@@ -760,4 +879,55 @@ fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
         };
         f.render_widget(text, area.inner(&margin));
     }
+}
+
+fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
+    let mut state = state.borrow_mut();
+
+    let rects = Layout::default()
+        .constraints([Constraint::Percentage(100)].as_ref())
+        .margin(5)
+        .split(f.size());
+
+    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    let normal_style = Style::default().bg(Color::White);
+    let header_cells = state.models_table.columns.iter().map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+    let header = Row::new(header_cells)
+        .style(normal_style)
+        .height(1)
+        .bottom_margin(1);
+
+    let rows = state.models_table.rows.iter().map(|item| {
+        let height = item
+            .iter()
+            .map(|content| content.chars().filter(|c| *c == '\n').count())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let cells = item.iter().cloned().map(|c| Cell::from(c));
+        Row::new(cells).height(height as u16).bottom_margin(0)
+    });
+
+    let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
+    let t = Table::new(rows)
+        .header(header)
+        .highlight_style(selected_style)
+        .highlight_symbol(selection_indicator.as_str())
+        .widths(&[
+            Constraint::Percentage(50),
+            Constraint::Length(30),
+            Constraint::Min(10),
+        ]);
+
+    let margin = Margin {
+        horizontal: 2,
+        vertical: 1,
+    };
+    f.render_stateful_widget(t, area.inner(&margin), &mut state.models_table.state);
 }
