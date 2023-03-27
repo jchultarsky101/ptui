@@ -9,7 +9,11 @@ use dirs::home_dir;
 use exitcode;
 use log::{debug, warn};
 use log::{error, info};
-use pcli::{configuration::ClientConfiguration, model::Folder, service, token};
+use pcli::{
+    configuration::ClientConfiguration,
+    model::{Folder, Model},
+    service, token,
+};
 use std::{
     cell::{RefCell, RefMut},
     env,
@@ -155,13 +159,14 @@ struct State<'a> {
     previous_mode: InputMode,
     search_field: TextArea<'a>,
     folder_list: StatefulList<Folder>,
-    models_table: StatefulTable<'a, String>,
+    models_table: StatefulTable<'a, Model>,
     status_line: String,
     help_text: String,
     display_help: bool,
     display_tenants: bool,
     tenants: StatefulList<String>,
     active_tenant: Option<String>,
+    active_folder: Option<String>,
     configuration: ClientConfiguration,
     api: Option<service::Api>,
 }
@@ -173,13 +178,14 @@ impl<'a> State<'a> {
             previous_mode: InputMode::Tenant,
             search_field: TextArea::default(),
             folder_list: StatefulList::default(), //with_items(vec![]),
-            models_table: StatefulTable::with_columns(vec!["UUID", "Name", "Status"]),
+            models_table: StatefulTable::with_columns(vec!["Name", "Status", "UUID"]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
             display_tenants: true,
             tenants: StatefulList::default(),
             active_tenant: None,
+            active_folder: None,
             configuration,
             api: None,
         }
@@ -195,21 +201,7 @@ impl<'a> State<'a> {
 
         self.search_field.set_cursor_line_style(Style::default());
 
-        self.models_table.add_row(vec![
-            String::from("UUID_1"),
-            String::from("Name_1"),
-            String::from("Status_1"),
-        ]);
-        self.models_table.add_row(vec![
-            String::from("UUID_2"),
-            String::from("Name_2"),
-            String::from("Status_2"),
-        ]);
-        self.models_table.add_row(vec![
-            String::from("UUID_3"),
-            String::from("Name_3"),
-            String::from("Status_3"),
-        ]);
+        self.models_table.clear();
     }
 
     pub fn initialize_service(&mut self) -> Result<(), PtuiError> {
@@ -397,7 +389,7 @@ impl<T> Default for StatefulList<T> {
 struct StatefulTable<'a, T> {
     state: TableState,
     columns: Vec<&'a str>,
-    rows: Vec<Vec<T>>,
+    rows: Vec<T>,
 }
 
 impl<'a, T> StatefulTable<'a, T> {
@@ -409,8 +401,12 @@ impl<'a, T> StatefulTable<'a, T> {
         }
     }
 
-    fn add_row(&mut self, row: Vec<T>) {
+    fn add_row(&mut self, row: T) {
         self.rows.push(row);
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
     }
 
     pub fn next(&mut self) {
@@ -672,17 +668,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                         match selected {
                             Some(index) => match state.folder_list.items.get(index) {
                                 Some(folder) => {
-                                    debug!("Selected folder [{}] \"{}\"", folder.id, folder.name);
+                                    let name = folder.name.to_owned();
+                                    let id = folder.id;
+                                    state.active_folder = Some(name.clone());
+                                    debug!("Selected folder [{}] \"{}\"", id, name.clone());
 
                                     match &state.api {
                                         Some(api) => {
                                             debug!(
                                                 "Reading the list of models for folder {}...",
-                                                folder.id
+                                                id
                                             );
 
                                             let mut folders: Vec<u32> = Vec::new();
-                                            folders.push(folder.id);
+                                            folders.push(id);
 
                                             let models = api.list_all_models(folders, None, false);
                                             match models {
@@ -691,16 +690,33 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                                         "Found {} model(s)",
                                                         models.models.len()
                                                     );
+
+                                                    state.models_table.clear();
+                                                    models.models.iter().cloned().for_each(
+                                                        |model| {
+                                                            state.models_table.add_row(model);
+                                                        },
+                                                    );
                                                 }
                                                 Err(e) => error!("Error reading models: {}", e),
                                             }
                                         }
-                                        None => {}
+                                        None => {
+                                            state.active_folder = None;
+                                            state.models_table.clear();
+                                        }
                                     }
                                 }
-                                None => {}
+                                None => {
+                                    state.active_folder = None;
+                                    state.models_table.clear();
+                                }
                             },
-                            None => warn!("No folder selected"),
+                            None => {
+                                state.active_folder = None;
+                                state.models_table.clear();
+                                warn!("No folder selected");
+                            }
                         }
                     }
                     _ => {}
@@ -742,7 +758,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                         "Incompatible model row item",
                                     ),
                                 ));
-                                debug!("Selected model \"{}\"", selected_row.unwrap()[0]);
+                                debug!("Selected model \"{}\"", selected_row.unwrap().uuid);
                             }
                             None => warn!("No model selected"),
                         }
@@ -862,7 +878,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                                 folders.folders.iter().for_each(|f| {
                                                     state.add_folder(f.clone());
                                                 });
-                                                debug!("List of fodlers ready");
+                                                debug!("List of folders ready");
                                             }
                                             Err(e) => {
                                                 error!("Failed to read the list of fodlers: {}", e);
@@ -950,8 +966,19 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
 
     folders_section(f, state, content_chunks[0]);
 
+    let active_folder = match state.active_folder.clone() {
+        Some(name) => name.clone(),
+        None => String::from(""),
+    };
+
+    let title = format!(
+        "Models ({}:{})",
+        active_folder.clone(),
+        state.models_table.rows.len()
+    );
+
     let models_list_section_block = Block::default()
-        .title("Models")
+        .title(title.as_str())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(match state.mode {
@@ -1179,15 +1206,12 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area:
         .height(1)
         .bottom_margin(1);
 
-    let rows = state.models_table.rows.iter().map(|item| {
-        let height = item
-            .iter()
-            .map(|content| content.chars().filter(|c| *c == '\n').count())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let cells = item.iter().cloned().map(|c| Cell::from(c));
-        Row::new(cells).height(height as u16).bottom_margin(0)
+    let rows = state.models_table.rows.iter().map(|model| {
+        let mut cells: Vec<Cell> = Vec::new();
+        cells.push(Cell::from(model.name.clone()));
+        cells.push(Cell::from(model.state.clone()));
+        cells.push(Cell::from(model.uuid.to_string()));
+        Row::new(cells).height(1).bottom_margin(0)
     });
 
     let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
@@ -1196,9 +1220,9 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area:
         .highlight_style(selected_style)
         .highlight_symbol(selection_indicator.as_str())
         .widths(&[
-            Constraint::Percentage(50),
-            Constraint::Length(30),
-            Constraint::Min(10),
+            Constraint::Length(50),
+            Constraint::Length(10),
+            Constraint::Length(36),
         ]);
 
     let margin = Margin {
