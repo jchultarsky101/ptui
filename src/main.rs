@@ -8,9 +8,9 @@ use crossterm::{
 use dirs::home_dir;
 use exitcode;
 use log::{debug, warn};
-use pcli::configuration::ClientConfiguration;
-use std::env;
-use std::{cell::RefCell, error::Error, fmt};
+use log::{error, info};
+use pcli::{configuration::ClientConfiguration, model::Folder, service, token};
+use std::{cell::RefCell, env, error::Error, fmt};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -77,6 +77,39 @@ Tenant Mode:
 <r>      Regenerate matches
 "#;
 
+#[derive(Debug)]
+pub enum PtuiError {
+    FailedToInitializeService,
+    TenantNotSelected,
+    ConfigurationError { cause: Option<String> },
+    InputError,
+    DisplayError,
+}
+
+impl fmt::Display for PtuiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::FailedToInitializeService => {
+                write!(f, "Failed to initialize the API service module")
+            }
+            Self::TenantNotSelected => write!(f, "Tenant not selected"),
+            Self::ConfigurationError { cause } => {
+                if cause.is_some() {
+                    write!(
+                        f,
+                        "Configuration error occurred: {}",
+                        cause.clone().unwrap().to_owned()
+                    )
+                } else {
+                    write!(f, "Configuration error occurred")
+                }
+            }
+            Self::InputError => write!(f, "Error occurred while receiving user input"),
+            Self::DisplayError => write!(f, "Error occurred while displaying output"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InputMode {
     Normal,
@@ -112,23 +145,11 @@ impl fmt::Display for InputMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Folder {
-    id: usize,
-    name: String,
-}
-
-impl Folder {
-    pub fn new(id: usize, name: String) -> Folder {
-        Folder { id, name }
-    }
-}
-
 struct State<'a> {
     mode: InputMode,
     previous_mode: InputMode,
     search_field: TextArea<'a>,
-    folder_list: StatefulList<String>,
+    folder_list: StatefulList<Folder>,
     models_table: StatefulTable<'a, String>,
     status_line: String,
     help_text: String,
@@ -137,6 +158,7 @@ struct State<'a> {
     tenants: StatefulList<String>,
     active_tenant: Option<String>,
     configuration: ClientConfiguration,
+    api: Option<service::Api>,
 }
 
 impl<'a> State<'a> {
@@ -154,6 +176,7 @@ impl<'a> State<'a> {
             tenants: StatefulList::default(),
             active_tenant: None,
             configuration,
+            api: None,
         }
     }
 
@@ -163,12 +186,7 @@ impl<'a> State<'a> {
             .keys()
             .clone()
             .for_each(|k| self.tenants.items.push(k.to_owned()));
-
-        self.add_folder(Folder::new(1, String::from("First")));
-        self.add_folder(Folder::new(2, String::from("Second")));
-        self.add_folder(Folder::new(2, String::from("Third")));
-        self.add_folder(Folder::new(2, String::from("Fourth")));
-        self.add_folder(Folder::new(2, String::from("Fifth")));
+        self.tenants.items.sort();
 
         self.search_field.set_cursor_line_style(Style::default());
 
@@ -189,8 +207,47 @@ impl<'a> State<'a> {
         ]);
     }
 
+    pub fn initialize_service(&mut self) -> Result<(), PtuiError> {
+        if self.active_tenant.is_none() {
+            return Err(PtuiError::TenantNotSelected);
+        }
+
+        let active_tenant = self.active_tenant.clone().unwrap().to_owned();
+
+        token::invalidate_token(&active_tenant).unwrap();
+        let api_configuration =
+            pcli::configuration::from_client_configuration(&self.configuration, &active_tenant);
+
+        let api: Option<service::Api> = match api_configuration {
+            Ok(api_configuration) => Some(service::Api::new(
+                api_configuration.base_url,
+                active_tenant.clone(),
+                api_configuration.access_token,
+            )),
+            Err(e) => {
+                return Err(PtuiError::ConfigurationError {
+                    cause: match e.source() {
+                        Some(e) => Some(e.to_string()),
+                        None => None,
+                    },
+                });
+            }
+        };
+
+        info!(
+            "Started a new session with Physna for tenant {}",
+            active_tenant.clone()
+        );
+        self.api = api;
+        Ok(())
+    }
+
+    pub fn clear_folders(&mut self) {
+        self.folder_list.items.clear();
+    }
+
     pub fn add_folder(&mut self, folder: Folder) {
-        self.folder_list.items.push(folder.name);
+        self.folder_list.items.push(folder.clone());
     }
 
     pub fn change_mode(&mut self, mode: InputMode) {
@@ -226,6 +283,7 @@ impl<'a> State<'a> {
                 self.status_line = String::from("Press any key to exit the help");
             }
             InputMode::Tenant => {
+                info!("Please select your tenant from the list");
                 self.status_line = String::from(
                     "Select and press <Enter> to specify a tenant, or press <Esc> to cancel",
                 )
@@ -448,17 +506,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    state: RefCell<State>,
-) -> Result<(), std::io::Error> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Result<(), PtuiError> {
     state.borrow_mut().initialize();
 
     loop {
-        terminal.draw(|f| ui(f, &state))?;
+        match terminal.draw(|f| ui(f, &state)) {
+            Ok(_frame) => {}
+            Err(_) => return Err(PtuiError::DisplayError),
+        }
 
         let mut state = state.borrow_mut();
-        let event = event::read()?;
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(_) => return Err(PtuiError::InputError),
+        };
+
         match state.mode {
             InputMode::Normal => match event {
                 Event::Key(key) => match key {
@@ -614,7 +676,8 @@ fn run_app<B: Backend>(
                                             "Incompatible folder list item",
                                         ),
                                     ));
-                                debug!("Selected folder \"{}\"", selected_item.unwrap());
+                                let folder = selected_item.unwrap();
+                                debug!("Selected folder [{}] \"{}\"", folder.id, folder.name);
                             }
                             None => warn!("No folder selected"),
                         }
@@ -756,7 +819,39 @@ fn run_app<B: Backend>(
 
                                 let active_tenant = selected_item.unwrap().to_owned();
                                 state.active_tenant = Some(active_tenant.clone());
-                                debug!("Selected tenant \"{}\"", active_tenant.clone());
+                                info!("Selected tenant \"{}\"", active_tenant.clone());
+
+                                match state.initialize_service() {
+                                    Ok(()) => {
+                                        debug!("Connected to the Physna service");
+                                    }
+                                    Err(e) => {
+                                        error!("Unable to connect to Physna, because of: {}", e)
+                                    }
+                                }
+
+                                // reloading the list of folders
+                                match &state.api {
+                                    Some(api) => {
+                                        let folders = api.get_list_of_folders();
+                                        match folders {
+                                            Ok(mut folders) => {
+                                                state.clear_folders();
+                                                folders.folders.sort();
+                                                folders.folders.iter().for_each(|f| {
+                                                    state.add_folder(f.clone());
+                                                });
+                                                debug!("List of fodlers ready");
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to read the list of fodlers: {}", e);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        warn!("No connection with Physna");
+                                    }
+                                }
 
                                 state.display_tenants = false;
                                 state.change_mode(InputMode::Normal);
@@ -901,7 +996,7 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
         .items
         .iter()
         .cloned()
-        .map(|i| ListItem::new(i))
+        .map(|i| ListItem::new(format!("[{: >4}] {}", i.id, i.name)))
         .collect();
 
     let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
@@ -1038,6 +1133,7 @@ fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>
             });
         f.render_widget(tenant_list_section_block, area);
 
+        // transform a vector of Strings to a vector of ListItems
         let visible_items: Vec<ListItem> = state
             .tenants
             .items
