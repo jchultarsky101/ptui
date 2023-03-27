@@ -10,7 +10,12 @@ use exitcode;
 use log::{debug, warn};
 use log::{error, info};
 use pcli::{configuration::ClientConfiguration, model::Folder, service, token};
-use std::{cell::RefCell, env, error::Error, fmt};
+use std::{
+    cell::{RefCell, RefMut},
+    env,
+    error::Error,
+    fmt,
+};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -507,15 +512,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Result<(), PtuiError> {
-    state.borrow_mut().initialize();
+    let mut state = state.borrow_mut();
+    state.initialize();
 
     loop {
-        match terminal.draw(|f| ui(f, &state)) {
+        match terminal.draw(|f| ui(f, &mut state)) {
             Ok(_frame) => {}
             Err(_) => return Err(PtuiError::DisplayError),
         }
 
-        let mut state = state.borrow_mut();
         let event = match event::read() {
             Ok(event) => event,
             Err(_) => return Err(PtuiError::InputError),
@@ -665,20 +670,36 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                     } => {
                         let selected = state.folder_list.state.selected();
                         match selected {
-                            Some(index) => {
-                                let selected_item =
-                                    state.folder_list.items.get(index).ok_or(Err::<
-                                        String,
-                                        std::io::Error,
-                                    >(
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            "Incompatible folder list item",
-                                        ),
-                                    ));
-                                let folder = selected_item.unwrap();
-                                debug!("Selected folder [{}] \"{}\"", folder.id, folder.name);
-                            }
+                            Some(index) => match state.folder_list.items.get(index) {
+                                Some(folder) => {
+                                    debug!("Selected folder [{}] \"{}\"", folder.id, folder.name);
+
+                                    match &state.api {
+                                        Some(api) => {
+                                            debug!(
+                                                "Reading the list of models for folder {}...",
+                                                folder.id
+                                            );
+
+                                            let mut folders: Vec<u32> = Vec::new();
+                                            folders.push(folder.id);
+
+                                            let models = api.list_all_models(folders, None, false);
+                                            match models {
+                                                Ok(models) => {
+                                                    debug!(
+                                                        "Found {} model(s)",
+                                                        models.models.len()
+                                                    );
+                                                }
+                                                Err(e) => error!("Error reading models: {}", e),
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                None => {}
+                            },
                             None => warn!("No folder selected"),
                         }
                     }
@@ -870,11 +891,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
     }
 }
 
-fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
+fn ui<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
     let size = f.size();
 
     let active_tenant = state
-        .borrow()
         .active_tenant
         .as_ref()
         .unwrap_or(&String::from("None"))
@@ -925,7 +945,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
         .split(container_chunks[1]);
 
     folders_section(f, state, content_chunks[0]);
@@ -934,7 +954,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
         .title("Models")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .style(match state.borrow().mode {
+        .style(match state.mode {
             InputMode::Model => Style::default().fg(Color::Yellow),
             _ => Style::default(),
         });
@@ -972,9 +992,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     help_section(f, state);
 }
 
-fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
-
+fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>, area: Rect) {
     let folder_list_chunk = Layout::default()
         .margin(2)
         .direction(Direction::Vertical)
@@ -1009,15 +1027,11 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
         )
         .highlight_symbol(selection_indicator.as_str());
 
-    f.render_stateful_widget(
-        folder_list,
-        folder_list_chunk[0],
-        &mut state.folder_list.state,
-    );
+    let mut folder_list_state = state.folder_list.state.clone();
+    f.render_stateful_widget(folder_list, folder_list_chunk[0], &mut folder_list_state);
 }
 
-fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let state = state.borrow();
+fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>, area: Rect) {
     let text = vec![Spans::from(vec![
         Span::styled(
             format!(" {} ", char::from_u32(0x25B6).unwrap()),
@@ -1041,9 +1055,7 @@ fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
     f.render_widget(status, status_chunk[0]);
 }
 
-fn search_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
-
+fn search_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area: Rect) {
     state.search_field.set_style(Style::default());
     let search_block = Block::default()
         .title("Search")
@@ -1091,9 +1103,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
-    let state = state.borrow();
-
+fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>) {
     if state.show_help() {
         let block = Block::default().title("Help").borders(Borders::ALL);
         let area = centered_rect(50, 50, f.size());
@@ -1109,9 +1119,7 @@ fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     }
 }
 
-fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
-    let mut state = state.borrow_mut();
-
+fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
     if state.display_tenants {
         let block = Block::default().title("Tenant").borders(Borders::ALL);
         let area = centered_rect(30, 50, f.size());
@@ -1156,9 +1164,7 @@ fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>
     }
 }
 
-fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
-
+fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area: Rect) {
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let normal_style = Style::default().bg(Color::White);
     let header_cells = state.models_table.columns.iter().map(|h| {
