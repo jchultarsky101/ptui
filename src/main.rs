@@ -185,7 +185,7 @@ struct State<'a> {
     display_tenants: bool,
     tenants: StatefulList<String>,
     active_tenant: Option<String>,
-    active_folder: Option<String>,
+    active_folder: Option<Folder>,
     active_model: Option<Model>,
     configuration: ClientConfiguration,
     api: Option<service::Api>,
@@ -647,54 +647,91 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                 },
                 _ => {}
             },
-            InputMode::Search => match event {
-                Event::Key(key) => match key {
-                    KeyEvent {
-                        code: KeyCode::Esc, ..
-                    } => state.change_mode(InputMode::Normal),
-                    KeyEvent {
-                        code: KeyCode::Enter,
-                        ..
-                    } => {
-                        let text = state.search_field.lines()[0].clone();
-                        debug!("Search for \"{}\"", text);
-                    }
-                    KeyEvent {
-                        code: KeyCode::Char('h'),
-                        modifiers: KeyModifiers::CONTROL,
-                        ..
-                    } => {
-                        state.set_help(HelpType::Search);
-                        state.change_mode(InputMode::Help);
-                    }
-                    _ => {
-                        let input: Input = Input {
-                            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-                            alt: key.modifiers.contains(KeyModifiers::ALT),
-                            key: match key.code {
-                                KeyCode::Char(c) => tui_textarea::Key::Char(c),
-                                KeyCode::Backspace => tui_textarea::Key::Backspace,
-                                KeyCode::Enter => tui_textarea::Key::Enter,
-                                KeyCode::Left => tui_textarea::Key::Left,
-                                KeyCode::Right => tui_textarea::Key::Right,
-                                KeyCode::Up => tui_textarea::Key::Up,
-                                KeyCode::Down => tui_textarea::Key::Down,
-                                KeyCode::Tab => tui_textarea::Key::Tab,
-                                KeyCode::Delete => tui_textarea::Key::Delete,
-                                KeyCode::Home => tui_textarea::Key::Home,
-                                KeyCode::End => tui_textarea::Key::End,
-                                KeyCode::PageUp => tui_textarea::Key::PageUp,
-                                KeyCode::PageDown => tui_textarea::Key::PageDown,
-                                KeyCode::Esc => tui_textarea::Key::Esc,
-                                KeyCode::F(x) => tui_textarea::Key::F(x),
-                                _ => tui_textarea::Key::Null,
-                            },
-                        };
-                        state.search_field.input(input);
-                    }
-                },
-                _ => {}
-            },
+            InputMode::Search => {
+                match event {
+                    Event::Key(key) => match key {
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } => state.change_mode(InputMode::Normal),
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => match &state.active_folder {
+                            Some(folder) => {
+                                let text = state.search_field.lines()[0].clone();
+                                if !text.is_empty() {
+                                    debug!(
+                                        "Searching for \"{}\" in folder {}",
+                                        text,
+                                        folder.name.clone()
+                                    );
+
+                                    let api = &state.api;
+                                    match api {
+                                        Some(api) => {
+                                            let folders = vec![folder.id];
+                                            let result =
+                                                api.list_all_models(folders, Some(&text), false);
+                                            match result {
+                                                Ok(models) => {
+                                                    info!("Found {} model(s) matching the search clause", models.models.len());
+                                                }
+                                                Err(e) => {
+                                                    error!("{}", e);
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            error!("No connection to Physna yet!");
+                                        }
+                                    }
+                                } else {
+                                    warn!("Please, enter a search clause");
+                                }
+                            }
+                            None => {
+                                state.status_line =
+                                    String::from("Please, select a folder for the search");
+                                warn!("Please, select a folder from the list of folders before you can search");
+                            }
+                        },
+                        KeyEvent {
+                            code: KeyCode::Char('h'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            state.set_help(HelpType::Search);
+                            state.change_mode(InputMode::Help);
+                        }
+                        _ => {
+                            let input: Input = Input {
+                                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                                alt: key.modifiers.contains(KeyModifiers::ALT),
+                                key: match key.code {
+                                    KeyCode::Char(c) => tui_textarea::Key::Char(c),
+                                    KeyCode::Backspace => tui_textarea::Key::Backspace,
+                                    KeyCode::Enter => tui_textarea::Key::Enter,
+                                    KeyCode::Left => tui_textarea::Key::Left,
+                                    KeyCode::Right => tui_textarea::Key::Right,
+                                    KeyCode::Up => tui_textarea::Key::Up,
+                                    KeyCode::Down => tui_textarea::Key::Down,
+                                    KeyCode::Tab => tui_textarea::Key::Tab,
+                                    KeyCode::Delete => tui_textarea::Key::Delete,
+                                    KeyCode::Home => tui_textarea::Key::Home,
+                                    KeyCode::End => tui_textarea::Key::End,
+                                    KeyCode::PageUp => tui_textarea::Key::PageUp,
+                                    KeyCode::PageDown => tui_textarea::Key::PageDown,
+                                    KeyCode::Esc => tui_textarea::Key::Esc,
+                                    KeyCode::F(x) => tui_textarea::Key::F(x),
+                                    _ => tui_textarea::Key::Null,
+                                },
+                            };
+                            state.search_field.input(input);
+                        }
+                    },
+                    _ => {}
+                }
+            }
             InputMode::Folder => match event {
                 Event::Key(key) => match key {
                     KeyEvent {
@@ -742,7 +779,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                 Some(folder) => {
                                     let name = folder.name.to_owned();
                                     let id = folder.id;
-                                    state.active_folder = Some(name.clone());
+                                    state.active_folder = Some(folder.clone());
                                     debug!("Selected folder [{}] \"{}\"", id, name.clone());
 
                                     match &state.api {
@@ -1126,14 +1163,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
 
     folders_section(f, state, content_chunks[0]);
 
-    let active_folder = match state.active_folder.clone() {
-        Some(name) => name.clone(),
+    let active_folder_name = match &state.active_folder {
+        Some(folder) => format!("{}", folder.name.clone()),
         None => String::from(""),
     };
 
     let title = format!(
         "Models ({}:{})",
-        active_folder.clone(),
+        active_folder_name,
         state.models_table.rows.len()
     );
 
@@ -1246,8 +1283,12 @@ fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>, area: Rec
 
 fn search_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area: Rect) {
     state.search_field.set_style(Style::default());
+    let title = match &state.active_folder {
+        Some(folder) => format!("Search ({})", folder.name.clone()),
+        None => format!("Search"),
+    };
     let search_block = Block::default()
-        .title("Search")
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(match state.mode {
