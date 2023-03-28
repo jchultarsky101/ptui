@@ -63,7 +63,9 @@ const FOLDER_MODE_HELP: &str = r#"
 Folder Mode:
 
 <Esc>    Exit to Normal mode
-<r>      Reload the list of folders
+<Enter>  Select folder
+<Up>     Move up
+<Down>   Move down
 "#;
 
 const MODEL_MODE_HELP: &str = r#"
@@ -74,7 +76,12 @@ Model Mode:
 <n>      Sort by name
 <t>      Sort by type
 <s>      Sort by status
+<p>      Reprocess model
 <r>      Reload the list of models
+<Up>     Move up
+<Down>   Move down
+<PgUp>   Move a page up
+<PfDown> Move a page down
 "#;
 
 const MODEL_DETAIL_MODE_HELP: &str = r#"
@@ -647,91 +654,93 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                 },
                 _ => {}
             },
-            InputMode::Search => {
-                match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => match &state.active_folder {
-                            Some(folder) => {
-                                let text = state.search_field.lines()[0].clone();
-                                if !text.is_empty() {
-                                    debug!(
-                                        "Searching for \"{}\" in folder {}",
-                                        text,
-                                        folder.name.clone()
-                                    );
+            InputMode::Search => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => match &state.active_folder {
+                        Some(folder) => {
+                            let text = state.search_field.lines()[0].clone();
+                            if !text.is_empty() {
+                                debug!(
+                                    "Searching for \"{}\" in folder {}",
+                                    text,
+                                    folder.name.clone()
+                                );
 
-                                    let api = &state.api;
-                                    match api {
-                                        Some(api) => {
-                                            let folders = vec![folder.id];
-                                            let result =
-                                                api.list_all_models(folders, Some(&text), false);
-                                            match result {
-                                                Ok(models) => {
-                                                    info!("Found {} model(s) matching the search clause", models.models.len());
-                                                }
-                                                Err(e) => {
-                                                    error!("{}", e);
-                                                }
+                                let api = &state.api;
+                                match api {
+                                    Some(api) => {
+                                        let folders = vec![folder.id];
+                                        let result =
+                                            api.list_all_models(folders, Some(&text), false);
+                                        match result {
+                                            Ok(mut models) => {
+                                                models.models.sort_by(|a, b| a.name.cmp(&b.name));
+                                                info!(
+                                                    "Found {} model(s) matching the search clause",
+                                                    models.models.len()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("{}", e);
                                             }
                                         }
-                                        None => {
-                                            error!("No connection to Physna yet!");
-                                        }
                                     }
-                                } else {
-                                    warn!("Please, enter a search clause");
+                                    None => {
+                                        error!("No connection to Physna yet!");
+                                    }
                                 }
+                            } else {
+                                warn!("Please, enter a search clause");
                             }
-                            None => {
-                                state.status_line =
-                                    String::from("Please, select a folder for the search");
-                                warn!("Please, select a folder from the list of folders before you can search");
-                            }
-                        },
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            modifiers: KeyModifiers::CONTROL,
-                            ..
-                        } => {
-                            state.set_help(HelpType::Search);
-                            state.change_mode(InputMode::Help);
                         }
-                        _ => {
-                            let input: Input = Input {
-                                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-                                alt: key.modifiers.contains(KeyModifiers::ALT),
-                                key: match key.code {
-                                    KeyCode::Char(c) => tui_textarea::Key::Char(c),
-                                    KeyCode::Backspace => tui_textarea::Key::Backspace,
-                                    KeyCode::Enter => tui_textarea::Key::Enter,
-                                    KeyCode::Left => tui_textarea::Key::Left,
-                                    KeyCode::Right => tui_textarea::Key::Right,
-                                    KeyCode::Up => tui_textarea::Key::Up,
-                                    KeyCode::Down => tui_textarea::Key::Down,
-                                    KeyCode::Tab => tui_textarea::Key::Tab,
-                                    KeyCode::Delete => tui_textarea::Key::Delete,
-                                    KeyCode::Home => tui_textarea::Key::Home,
-                                    KeyCode::End => tui_textarea::Key::End,
-                                    KeyCode::PageUp => tui_textarea::Key::PageUp,
-                                    KeyCode::PageDown => tui_textarea::Key::PageDown,
-                                    KeyCode::Esc => tui_textarea::Key::Esc,
-                                    KeyCode::F(x) => tui_textarea::Key::F(x),
-                                    _ => tui_textarea::Key::Null,
-                                },
-                            };
-                            state.search_field.input(input);
+                        None => {
+                            state.status_line =
+                                String::from("Please, select a folder for the search");
+                            warn!("Please, select a folder from the list of folders before you can search");
                         }
                     },
-                    _ => {}
-                }
-            }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => {
+                        state.set_help(HelpType::Search);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {
+                        let input: Input = Input {
+                            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                            alt: key.modifiers.contains(KeyModifiers::ALT),
+                            key: match key.code {
+                                KeyCode::Char(c) => tui_textarea::Key::Char(c),
+                                KeyCode::Backspace => tui_textarea::Key::Backspace,
+                                KeyCode::Enter => tui_textarea::Key::Enter,
+                                KeyCode::Left => tui_textarea::Key::Left,
+                                KeyCode::Right => tui_textarea::Key::Right,
+                                KeyCode::Up => tui_textarea::Key::Up,
+                                KeyCode::Down => tui_textarea::Key::Down,
+                                KeyCode::Tab => tui_textarea::Key::Tab,
+                                KeyCode::Delete => tui_textarea::Key::Delete,
+                                KeyCode::Home => tui_textarea::Key::Home,
+                                KeyCode::End => tui_textarea::Key::End,
+                                KeyCode::PageUp => tui_textarea::Key::PageUp,
+                                KeyCode::PageDown => tui_textarea::Key::PageDown,
+                                KeyCode::Esc => tui_textarea::Key::Esc,
+                                KeyCode::F(x) => tui_textarea::Key::F(x),
+                                _ => tui_textarea::Key::Null,
+                            },
+                        };
+                        state.search_field.input(input);
+                    }
+                },
+                _ => {}
+            },
             InputMode::Folder => match event {
                 Event::Key(key) => match key {
                     KeyEvent {
@@ -794,13 +803,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
 
                                             let models = api.list_all_models(folders, None, false);
                                             match models {
-                                                Ok(models) => {
+                                                Ok(mut models) => {
                                                     debug!(
                                                         "Found {} model(s)",
                                                         models.models.len()
                                                     );
 
                                                     state.models_table.clear();
+                                                    models
+                                                        .models
+                                                        .sort_by(|a, b| a.name.cmp(&b.name));
                                                     models.models.iter().cloned().for_each(
                                                         |model| {
                                                             state.models_table.add_row(model);
@@ -901,6 +913,70 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                             .models_table
                             .rows
                             .sort_by(|a, b| a.state.cmp(&b.state));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('r'),
+                        ..
+                    } => {
+                        // refresh
+                        match &state.api {
+                            Some(api) => match &state.active_folder {
+                                Some(folder) => {
+                                    info!(
+                                        "Reloading the list of models for folder {}...",
+                                        folder.name.clone()
+                                    );
+                                    match api.list_all_models(vec![folder.id], None, false) {
+                                        Ok(mut models) => {
+                                            models.models.sort_by(|a, b| a.name.cmp(&b.name));
+                                            state.models_table.rows = models.models.clone();
+                                            info!("Models reloaded");
+                                        }
+                                        Err(e) => error!("{}", e),
+                                    }
+                                }
+                                None => warn!("Select a folder first"),
+                            },
+                            None => warn!("Connect to Physna first"),
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('p'),
+                        ..
+                    } => {
+                        // reprocess
+                        let selected = state.models_table.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_row = state.models_table.rows.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible model row item",
+                                    ),
+                                ));
+
+                                let model = selected_row.unwrap().clone();
+                                debug!("Selected model \"{}\"", model.uuid.clone());
+                                state.active_model = Some(model.clone());
+
+                                match &state.api {
+                                    Some(api) => match api.reprocess_model(&model.uuid) {
+                                        Ok(()) => {
+                                            info!(
+                                                "Model {} submitted for reprocessing. Refresh models to check status",
+                                                model.uuid.to_string()
+                                            );
+                                        }
+                                        Err(e) => error!("{}", e),
+                                    },
+                                    None => error!("Not connected to Physna"),
+                                }
+                            }
+                            None => warn!("Select a model for reprocessing"),
+                        }
                     }
                     KeyEvent {
                         code: KeyCode::Enter,
@@ -1503,7 +1579,7 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area:
             Constraint::Length(30),
             Constraint::Length(8),
             Constraint::Length(8),
-            Constraint::Length(13),
+            Constraint::Length(15),
             Constraint::Length(36),
         ]);
 
