@@ -9,6 +9,7 @@ use dirs::home_dir;
 use exitcode;
 use log::{debug, warn};
 use log::{error, info};
+use open;
 use pcli::{
     configuration::ClientConfiguration,
     model::{Folder, Model},
@@ -69,7 +70,18 @@ const MODEL_MODE_HELP: &str = r#"
 Model Mode:
 
 <Esc>    Exit to Normal mode
+<Enter>  View the model details
+<n>      Sort by name
+<t>      Sort by type
+<s>      Sort by status
 <r>      Reload the list of models
+"#;
+
+const MODEL_DETAIL_MODE_HELP: &str = r#"
+Model Detail Mode:
+
+<Enter>  Open the model in a browser
+Press any other key to exit back to Model mode
 "#;
 
 const MATCH_MODE_HELP: &str = r#"
@@ -93,6 +105,7 @@ pub enum PtuiError {
     ConfigurationError { cause: Option<String> },
     InputError,
     DisplayError,
+    FailedToLoadThumbnail { cause: String },
 }
 
 impl fmt::Display for PtuiError {
@@ -115,6 +128,9 @@ impl fmt::Display for PtuiError {
             }
             Self::InputError => write!(f, "Error occurred while receiving user input"),
             Self::DisplayError => write!(f, "Error occurred while displaying output"),
+            Self::FailedToLoadThumbnail { cause } => {
+                write!(f, "Failed to load thumbnail, because of: {}", cause)
+            }
         }
     }
 }
@@ -125,6 +141,7 @@ enum InputMode {
     Search,
     Folder,
     Model,
+    ModelDetail,
     Match,
     Help,
     Tenant,
@@ -136,6 +153,7 @@ enum HelpType {
     Search,
     Folder,
     Model,
+    ModelDetail,
     Match,
     Tenant,
 }
@@ -147,6 +165,7 @@ impl fmt::Display for InputMode {
             InputMode::Search => write!(f, "Search"),
             InputMode::Folder => write!(f, "Folder"),
             InputMode::Model => write!(f, "Model "),
+            InputMode::ModelDetail => write!(f, "ModDet"),
             InputMode::Match => write!(f, "Match "),
             InputMode::Help => write!(f, "Help  "),
             InputMode::Tenant => write!(f, "Tenant"),
@@ -167,6 +186,7 @@ struct State<'a> {
     tenants: StatefulList<String>,
     active_tenant: Option<String>,
     active_folder: Option<String>,
+    active_model: Option<Model>,
     configuration: ClientConfiguration,
     api: Option<service::Api>,
 }
@@ -178,7 +198,9 @@ impl<'a> State<'a> {
             previous_mode: InputMode::Tenant,
             search_field: TextArea::default(),
             folder_list: StatefulList::default(), //with_items(vec![]),
-            models_table: StatefulTable::with_columns(vec!["Name", "Status", "UUID"]),
+            models_table: StatefulTable::with_columns(vec![
+                "Name", "Type", "Assembly", "Status", "UUID",
+            ]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
@@ -186,6 +208,7 @@ impl<'a> State<'a> {
             tenants: StatefulList::default(),
             active_tenant: None,
             active_folder: None,
+            active_model: None,
             configuration,
             api: None,
         }
@@ -272,6 +295,9 @@ impl<'a> State<'a> {
                     "Press <Esc> to return to Normal mode, <h> for help, or <Tab> for Folder mode",
                 );
             }
+            InputMode::ModelDetail => {
+                self.status_line = String::from("Press <Esc> to return to Model mode, <h> for help, or <Enter> to open the model in a browser");
+            }
             InputMode::Match => {
                 self.status_line =
                     String::from("Press <Esc> to return to Normal mode, <h> for help");
@@ -304,6 +330,10 @@ impl<'a> State<'a> {
             }
             HelpType::Model => {
                 self.help_text = String::from(MODEL_MODE_HELP);
+                self.display_help = true;
+            }
+            HelpType::ModelDetail => {
+                self.help_text = String::from(MODEL_DETAIL_MODE_HELP);
                 self.display_help = true;
             }
             HelpType::Match => {
@@ -435,6 +465,48 @@ impl<'a, T> StatefulTable<'a, T> {
             None => 0,
         };
         self.state.select(Some(i));
+    }
+
+    pub fn page_up(&mut self) {
+        match self.state.selected() {
+            Some(index) => {
+                let len = self.rows.len();
+                if len > 0 {
+                    let mut index: i32 = (index as i32) - 20;
+                    if index < 0 {
+                        index = 0;
+                    };
+                    self.state.select(Some(index as usize));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        match self.state.selected() {
+            Some(index) => {
+                let len = self.rows.len();
+                if len > 0 {
+                    let mut index = index + 20;
+                    if index >= len {
+                        index = len - 1;
+                    };
+                    self.state.select(Some(index as usize));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.state.select(Some(0));
+    }
+
+    pub fn end(&mut self) {
+        if self.rows.len() > 0 {
+            self.state.select(Some(self.rows.len() - 1));
+        }
     }
 }
 
@@ -697,6 +769,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                                             state.models_table.add_row(model);
                                                         },
                                                     );
+                                                    state.models_table.state.select(Some(0));
                                                 }
                                                 Err(e) => error!("Error reading models: {}", e),
                                             }
@@ -743,6 +816,56 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                         state.models_table.next();
                     }
                     KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
+                        state.models_table.page_up();
+                    }
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
+                        state.models_table.page_down();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.models_table.home();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.models_table.end();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('n'),
+                        ..
+                    } => {
+                        // sort by name
+                        state.models_table.rows.sort_by(|a, b| a.name.cmp(&b.name));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        ..
+                    } => {
+                        // sort by type
+                        state
+                            .models_table
+                            .rows
+                            .sort_by(|a, b| a.file_type.cmp(&b.file_type));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } => {
+                        // sort by state
+                        state
+                            .models_table
+                            .rows
+                            .sort_by(|a, b| a.state.cmp(&b.state));
+                    }
+                    KeyEvent {
                         code: KeyCode::Enter,
                         ..
                     } => {
@@ -758,7 +881,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                         "Incompatible model row item",
                                     ),
                                 ));
-                                debug!("Selected model \"{}\"", selected_row.unwrap().uuid);
+
+                                let model = selected_row.unwrap();
+                                debug!("Selected model \"{}\"", model.uuid);
+                                state.active_model = Some(model.clone());
+                                state.change_mode(InputMode::ModelDetail);
                             }
                             None => warn!("No model selected"),
                         }
@@ -771,6 +898,38 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                         state.change_mode(InputMode::Help);
                     }
                     _ => {}
+                },
+                _ => {}
+            },
+            InputMode::ModelDetail => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let tenant = state.active_tenant.as_ref().unwrap();
+                        match &state.active_model {
+                            Some(model) => {
+                                let url = format!(
+                                    "https://{}.physna.com/app/models/{}",
+                                    tenant,
+                                    model.uuid.to_string()
+                                );
+                                open::that(url.as_str()).unwrap();
+                            }
+                            None => {}
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::ModelDetail);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {
+                        state.change_mode(InputMode::Model);
+                    }
                 },
                 _ => {}
             },
@@ -878,6 +1037,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Res
                                                 folders.folders.iter().for_each(|f| {
                                                     state.add_folder(f.clone());
                                                 });
+                                                state.folder_list.state.select(Some(0));
                                                 debug!("List of folders ready");
                                             }
                                             Err(e) => {
@@ -1014,6 +1174,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
     f.render_widget(status_block, container_chunks[3]);
     status_section(f, state, container_chunks[3]);
 
+    model_details_section(f, state);
+
     tenant_selection_section(f, state);
 
     help_section(f, state);
@@ -1130,6 +1292,76 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn model_details_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>) {
+    match state.mode {
+        InputMode::ModelDetail if state.active_model.is_some() => {
+            let block = Block::default().title("Model").borders(Borders::ALL);
+            let area = centered_rect(45, 17, f.size());
+            f.render_widget(Clear, area); //this clears out the background
+            f.render_widget(block, area);
+
+            let margin = Margin {
+                horizontal: 2,
+                vertical: 2,
+            };
+            let content_area = area.inner(&margin);
+            let model_detail_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(100)].as_ref())
+                .split(content_area);
+
+            fn create_spans<'a>(name: &'a str, value: &'a String, color: Color) -> Spans<'a> {
+                Spans::from(vec![
+                    Span::styled(
+                        format!("{: <15} {} ", name, ":"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(value.as_str(), Style::default().fg(color)),
+                ])
+            }
+
+            let model = state.active_model.as_ref().unwrap().clone();
+            let uuid = model.uuid.to_string();
+            let name = model.name.clone();
+            let is_assembly = model.is_assembly.to_string();
+            let folder_id = model.folder_id.to_string();
+            let owner_id = model.owner_id.clone();
+            let created_at = model.created_at.clone();
+            let file_type = model.file_type.clone();
+            let units = model.units.clone();
+            let state = model.state.clone();
+            let attachment_url = model.attachment_url.unwrap_or_default();
+            let short_id = model.short_id.unwrap_or_default().to_string();
+            // let metadata: Option<Vec<ModelMetadataItem>>,
+
+            let mut props: Vec<Spans> = Vec::new();
+            props.push(create_spans("UUID", &uuid, Color::Yellow));
+            props.push(create_spans("Name", &name, Color::Yellow));
+            props.push(create_spans("Assembly", &is_assembly, Color::Yellow));
+            props.push(create_spans("Folder ID", &folder_id, Color::Yellow));
+            props.push(create_spans("Owner ID", &owner_id, Color::Yellow));
+            props.push(create_spans("Created At", &created_at, Color::Yellow));
+            props.push(create_spans("File Type", &file_type, Color::Yellow));
+            props.push(create_spans("Units", &units, Color::Yellow));
+            let status_color = match state.as_str() {
+                "finished" => Color::Green,
+                _ => Color::Red,
+            };
+            props.push(create_spans("State", &state, status_color));
+            props.push(create_spans(
+                "Attachment URL",
+                &attachment_url,
+                Color::Yellow,
+            ));
+            props.push(create_spans("Short ID", &short_id, Color::Yellow));
+
+            let props_paragraph = Paragraph::new(props).wrap(Wrap { trim: true });
+            f.render_widget(props_paragraph, model_detail_chunks[0]);
+        }
+        _ => {}
+    }
+}
+
 fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>) {
     if state.show_help() {
         let block = Block::default().title("Help").borders(Borders::ALL);
@@ -1207,9 +1439,16 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area:
         .bottom_margin(1);
 
     let rows = state.models_table.rows.iter().map(|model| {
+        let state_color = match model.state.as_str() {
+            "finished" => Color::Green,
+            _ => Color::Red,
+        };
+
         let mut cells: Vec<Cell> = Vec::new();
         cells.push(Cell::from(model.name.clone()));
-        cells.push(Cell::from(model.state.clone()));
+        cells.push(Cell::from(model.file_type.clone()));
+        cells.push(Cell::from(model.is_assembly.to_string()));
+        cells.push(Cell::from(model.state.clone()).style(Style::default().fg(state_color)));
         cells.push(Cell::from(model.uuid.to_string()));
         Row::new(cells).height(1).bottom_margin(0)
     });
@@ -1220,8 +1459,10 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area:
         .highlight_style(selected_style)
         .highlight_symbol(selection_indicator.as_str())
         .widths(&[
-            Constraint::Length(50),
-            Constraint::Length(10),
+            Constraint::Length(30),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(13),
             Constraint::Length(36),
         ]);
 
