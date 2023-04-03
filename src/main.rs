@@ -5,10 +5,22 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use log::trace;
+use dirs::home_dir;
+use exitcode;
 use log::{debug, warn};
-use std::env;
-use std::{cell::RefCell, error::Error, fmt, io::ErrorKind};
+use log::{error, info};
+use open;
+use pcli::{
+    configuration::ClientConfiguration,
+    model::{Folder, Model},
+    service, token,
+};
+use std::{
+    cell::{RefCell, RefMut},
+    env,
+    error::Error,
+    fmt,
+};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -22,12 +34,12 @@ use tui::{
 };
 use tui_logger::*;
 use tui_textarea::{self, Input, TextArea};
-use uuid::Uuid;
 
 const NORMAL_MODE_HELP: &str = r#"
 Normal Mode:
 
 <q>    Exit the program
+<t>    Select Physna tenant
 <f>    Switch to Folder mode
 <m>    Switch to Model mode
 
@@ -51,14 +63,32 @@ const FOLDER_MODE_HELP: &str = r#"
 Folder Mode:
 
 <Esc>    Exit to Normal mode
-<r>      Reload the list of folders
+<Enter>  Select folder
+<Up>     Move up
+<Down>   Move down
 "#;
 
 const MODEL_MODE_HELP: &str = r#"
 Model Mode:
 
 <Esc>    Exit to Normal mode
+<Enter>  View the model details
+<n>      Sort by name
+<t>      Sort by type
+<s>      Sort by status
+<p>      Reprocess model
 <r>      Reload the list of models
+<Up>     Move up
+<Down>   Move down
+<PgUp>   Move a page up
+<PfDown> Move a page down
+"#;
+
+const MODEL_DETAIL_MODE_HELP: &str = r#"
+Model Detail Mode:
+
+<Enter>  Open the model in a browser
+Press any other key to exit back to Model mode
 "#;
 
 const MATCH_MODE_HELP: &str = r#"
@@ -68,14 +98,60 @@ Match Mode:
 <r>      Regenerate matches
 "#;
 
+const TENANT_MODE_HELP: &str = r#"
+Tenant Mode:
+
+<Esc>    Exit to Normal mode
+<r>      Regenerate matches
+"#;
+
+#[derive(Debug)]
+pub enum PtuiError {
+    FailedToInitializeService,
+    TenantNotSelected,
+    ConfigurationError { cause: Option<String> },
+    InputError,
+    DisplayError,
+    FailedToLoadThumbnail { cause: String },
+}
+
+impl fmt::Display for PtuiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::FailedToInitializeService => {
+                write!(f, "Failed to initialize the API service module")
+            }
+            Self::TenantNotSelected => write!(f, "Tenant not selected"),
+            Self::ConfigurationError { cause } => {
+                if cause.is_some() {
+                    write!(
+                        f,
+                        "Configuration error occurred: {}",
+                        cause.clone().unwrap().to_owned()
+                    )
+                } else {
+                    write!(f, "Configuration error occurred")
+                }
+            }
+            Self::InputError => write!(f, "Error occurred while receiving user input"),
+            Self::DisplayError => write!(f, "Error occurred while displaying output"),
+            Self::FailedToLoadThumbnail { cause } => {
+                write!(f, "Failed to load thumbnail, because of: {}", cause)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InputMode {
     Normal,
     Search,
     Folder,
     Model,
+    ModelDetail,
     Match,
     Help,
+    Tenant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +160,9 @@ enum HelpType {
     Search,
     Folder,
     Model,
+    ModelDetail,
     Match,
+    Tenant,
 }
 
 impl fmt::Display for InputMode {
@@ -94,34 +172,11 @@ impl fmt::Display for InputMode {
             InputMode::Search => write!(f, "Search"),
             InputMode::Folder => write!(f, "Folder"),
             InputMode::Model => write!(f, "Model "),
+            InputMode::ModelDetail => write!(f, "ModDet"),
             InputMode::Match => write!(f, "Match "),
             InputMode::Help => write!(f, "Help  "),
+            InputMode::Tenant => write!(f, "Tenant"),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ModelState {
-    Received,
-    Indexing,
-    Ready,
-}
-
-struct Model {
-    id: Uuid,
-    name: String,
-    state: ModelState,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct Folder {
-    id: usize,
-    name: String,
-}
-
-impl Folder {
-    pub fn new(id: usize, name: String) -> Folder {
-        Folder { id, name }
     }
 }
 
@@ -129,55 +184,97 @@ struct State<'a> {
     mode: InputMode,
     previous_mode: InputMode,
     search_field: TextArea<'a>,
-    folder_list: StatefulList<String>,
-    models_table: StatefulTable<'a, String>,
+    folder_list: StatefulList<Folder>,
+    models_table: StatefulTable<'a, Model>,
     status_line: String,
     help_text: String,
     display_help: bool,
+    display_tenants: bool,
+    tenants: StatefulList<String>,
+    active_tenant: Option<String>,
+    active_folder: Option<Folder>,
+    active_model: Option<Model>,
+    configuration: ClientConfiguration,
+    api: Option<service::Api>,
 }
 
 impl<'a> State<'a> {
-    pub fn new() -> State<'static> {
+    pub fn new(configuration: ClientConfiguration) -> State<'static> {
         State {
-            mode: InputMode::Normal,
-            previous_mode: InputMode::Normal,
+            mode: InputMode::Tenant,
+            previous_mode: InputMode::Tenant,
             search_field: TextArea::default(),
             folder_list: StatefulList::default(), //with_items(vec![]),
-            models_table: StatefulTable::with_columns(vec!["UUID", "Name", "Status"]),
+            models_table: StatefulTable::with_columns(vec![
+                "Name", "Type", "Assembly", "Status", "UUID",
+            ]),
             status_line: String::new(),
             help_text: String::default(),
             display_help: false,
+            display_tenants: true,
+            tenants: StatefulList::default(),
+            active_tenant: None,
+            active_folder: None,
+            active_model: None,
+            configuration,
+            api: None,
         }
     }
 
     pub fn initialize(&mut self) {
-        self.add_folder(Folder::new(1, String::from("First")));
-        self.add_folder(Folder::new(2, String::from("Second")));
-        self.add_folder(Folder::new(2, String::from("Third")));
-        self.add_folder(Folder::new(2, String::from("Fourth")));
-        self.add_folder(Folder::new(2, String::from("Fifth")));
+        self.configuration
+            .tenants
+            .keys()
+            .clone()
+            .for_each(|k| self.tenants.items.push(k.to_owned()));
+        self.tenants.items.sort();
 
         self.search_field.set_cursor_line_style(Style::default());
 
-        self.models_table.add_row(vec![
-            String::from("UUID_1"),
-            String::from("Name_1"),
-            String::from("Status_1"),
-        ]);
-        self.models_table.add_row(vec![
-            String::from("UUID_2"),
-            String::from("Name_2"),
-            String::from("Status_2"),
-        ]);
-        self.models_table.add_row(vec![
-            String::from("UUID_3"),
-            String::from("Name_3"),
-            String::from("Status_3"),
-        ]);
+        self.models_table.clear();
+    }
+
+    pub fn initialize_service(&mut self) -> Result<(), PtuiError> {
+        if self.active_tenant.is_none() {
+            return Err(PtuiError::TenantNotSelected);
+        }
+
+        let active_tenant = self.active_tenant.clone().unwrap().to_owned();
+
+        token::invalidate_token(&active_tenant).unwrap();
+        let api_configuration =
+            pcli::configuration::from_client_configuration(&self.configuration, &active_tenant);
+
+        let api: Option<service::Api> = match api_configuration {
+            Ok(api_configuration) => Some(service::Api::new(
+                api_configuration.base_url,
+                active_tenant.clone(),
+                api_configuration.access_token,
+            )),
+            Err(e) => {
+                return Err(PtuiError::ConfigurationError {
+                    cause: match e.source() {
+                        Some(e) => Some(e.to_string()),
+                        None => None,
+                    },
+                });
+            }
+        };
+
+        info!(
+            "Started a new session with Physna for tenant {}",
+            active_tenant.clone()
+        );
+        self.api = api;
+        Ok(())
+    }
+
+    pub fn clear_folders(&mut self) {
+        self.folder_list.items.clear();
     }
 
     pub fn add_folder(&mut self, folder: Folder) {
-        self.folder_list.items.push(folder.name);
+        self.folder_list.items.push(folder.clone());
     }
 
     pub fn change_mode(&mut self, mode: InputMode) {
@@ -205,12 +302,21 @@ impl<'a> State<'a> {
                     "Press <Esc> to return to Normal mode, <h> for help, or <Tab> for Folder mode",
                 );
             }
+            InputMode::ModelDetail => {
+                self.status_line = String::from("Press <Esc> to return to Model mode, <h> for help, or <Enter> to open the model in a browser");
+            }
             InputMode::Match => {
                 self.status_line =
                     String::from("Press <Esc> to return to Normal mode, <h> for help");
             }
             InputMode::Help => {
                 self.status_line = String::from("Press any key to exit the help");
+            }
+            InputMode::Tenant => {
+                info!("Please select your tenant from the list");
+                self.status_line = String::from(
+                    "Select and press <Enter> to specify a tenant, or press <Esc> to cancel",
+                )
             }
         }
     }
@@ -233,8 +339,16 @@ impl<'a> State<'a> {
                 self.help_text = String::from(MODEL_MODE_HELP);
                 self.display_help = true;
             }
+            HelpType::ModelDetail => {
+                self.help_text = String::from(MODEL_DETAIL_MODE_HELP);
+                self.display_help = true;
+            }
             HelpType::Match => {
                 self.help_text = String::from(MATCH_MODE_HELP);
+                self.display_help = true;
+            }
+            HelpType::Tenant => {
+                self.help_text = String::from(TENANT_MODE_HELP);
                 self.display_help = true;
             }
         }
@@ -301,10 +415,6 @@ impl<T> StatefulList<T> {
             self.state.select(Some(self.items.len() - 1));
         }
     }
-
-    fn unselect(&mut self) {
-        self.state.select(None);
-    }
 }
 
 impl<T> Default for StatefulList<T> {
@@ -316,7 +426,7 @@ impl<T> Default for StatefulList<T> {
 struct StatefulTable<'a, T> {
     state: TableState,
     columns: Vec<&'a str>,
-    rows: Vec<Vec<T>>,
+    rows: Vec<T>,
 }
 
 impl<'a, T> StatefulTable<'a, T> {
@@ -328,16 +438,12 @@ impl<'a, T> StatefulTable<'a, T> {
         }
     }
 
-    fn add_row(&mut self, row: Vec<T>) {
+    fn add_row(&mut self, row: T) {
         self.rows.push(row);
     }
 
-    fn row(&self, index: usize) -> Option<&Vec<T>> {
-        self.rows.get(index)
-    }
-
-    fn delete_row(&mut self, index: usize) {
-        self.rows.remove(index);
+    fn clear(&mut self) {
+        self.rows.clear();
     }
 
     pub fn next(&mut self) {
@@ -367,6 +473,48 @@ impl<'a, T> StatefulTable<'a, T> {
         };
         self.state.select(Some(i));
     }
+
+    pub fn page_up(&mut self) {
+        match self.state.selected() {
+            Some(index) => {
+                let len = self.rows.len();
+                if len > 0 {
+                    let mut index: i32 = (index as i32) - 20;
+                    if index < 0 {
+                        index = 0;
+                    };
+                    self.state.select(Some(index as usize));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        match self.state.selected() {
+            Some(index) => {
+                let len = self.rows.len();
+                if len > 0 {
+                    let mut index = index + 20;
+                    if index >= len {
+                        index = len - 1;
+                    };
+                    self.state.select(Some(index as usize));
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.state.select(Some(0));
+    }
+
+    pub fn end(&mut self) {
+        if self.rows.len() > 0 {
+            self.state.select(Some(self.rows.len() - 1));
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -386,11 +534,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let home_directory = home_dir();
+    let home_directory = match home_directory {
+        Some(dir) => dir,
+        None => {
+            eprintln!("Error: Failed to determine the home directory");
+            ::std::process::exit(exitcode::DATAERR);
+        }
+    };
+    let home_directory = String::from(home_directory.to_str().unwrap());
+    let mut default_configuration_file_path = home_directory;
+    default_configuration_file_path.push_str("/.pcli.conf");
+
+    let configuration =
+        pcli::configuration::initialize(&String::from(default_configuration_file_path));
+    let configuration = match configuration {
+        Ok(configuration) => configuration,
+        Err(e) => {
+            eprintln!(
+                "Cannot initialize process with the provided configuration: {}",
+                e
+            );
+            ::std::process::exit(exitcode::CONFIG);
+        }
+    };
+
     tui_logger::init_logger(level_filter).unwrap();
     tui_logger::set_default_level(level_filter);
 
     // Prepare the state
-    let state = RefCell::new(State::new());
+    let state = RefCell::new(State::new(configuration));
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -413,269 +586,631 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    state: RefCell<State>,
-) -> Result<(), std::io::Error> {
-    state.borrow_mut().initialize();
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: RefCell<State>) -> Result<(), PtuiError> {
+    let mut state = state.borrow_mut();
+    state.initialize();
 
     loop {
-        terminal.draw(|f| ui(f, &state))?;
+        match terminal.draw(|f| ui(f, &mut state)) {
+            Ok(_frame) => {}
+            Err(_) => return Err(PtuiError::DisplayError),
+        }
 
-        let mut state = state.borrow_mut();
-        if let event = event::read()? {
-            match state.mode {
-                InputMode::Normal => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Char('q'),
-                            ..
-                        } => {
-                            return Ok(());
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('f'),
-                            ..
-                        }
-                        | KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => {
-                            state.change_mode(InputMode::Folder);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('s'),
-                            ..
-                        } => {
-                            state.change_mode(InputMode::Search);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('m'),
-                            ..
-                        } => state.change_mode(InputMode::Model),
-                        KeyEvent {
-                            code: KeyCode::Char('c'),
-                            ..
-                        } => state.change_mode(InputMode::Match),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::General);
-                            state.change_mode(InputMode::Help);
-                        }
-                        _ => {
-                            warn!("Unsupported key binding. Press <h> for help");
-                            state.status_line = String::from("Press <h> for help or <q> to exit");
-                        }
-                    },
-                    _ => {}
-                },
-                InputMode::Search => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let text = state.search_field.lines()[0].clone();
-                            debug!("Search for \"{}\"", text);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            modifiers: KeyModifiers::CONTROL,
-                            ..
-                        } => {
-                            state.set_help(HelpType::Search);
-                            state.change_mode(InputMode::Help);
-                        }
-                        input => {
-                            let input: Input = Input {
-                                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-                                alt: key.modifiers.contains(KeyModifiers::ALT),
-                                key: match key.code {
-                                    KeyCode::Char(c) => tui_textarea::Key::Char(c),
-                                    KeyCode::Backspace => tui_textarea::Key::Backspace,
-                                    KeyCode::Enter => tui_textarea::Key::Enter,
-                                    KeyCode::Left => tui_textarea::Key::Left,
-                                    KeyCode::Right => tui_textarea::Key::Right,
-                                    KeyCode::Up => tui_textarea::Key::Up,
-                                    KeyCode::Down => tui_textarea::Key::Down,
-                                    KeyCode::Tab => tui_textarea::Key::Tab,
-                                    KeyCode::Delete => tui_textarea::Key::Delete,
-                                    KeyCode::Home => tui_textarea::Key::Home,
-                                    KeyCode::End => tui_textarea::Key::End,
-                                    KeyCode::PageUp => tui_textarea::Key::PageUp,
-                                    KeyCode::PageDown => tui_textarea::Key::PageDown,
-                                    KeyCode::Esc => tui_textarea::Key::Esc,
-                                    KeyCode::F(x) => tui_textarea::Key::F(x),
-                                    _ => tui_textarea::Key::Null,
-                                },
-                            };
-                            state.search_field.input(input);
-                        }
-                    },
-                    _ => {}
-                },
-                InputMode::Folder => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => state.change_mode(InputMode::Model),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Folder);
-                            state.change_mode(InputMode::Help);
-                        }
-                        KeyEvent {
-                            code: KeyCode::Up, ..
-                        } => {
-                            state.folder_list.previous();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        } => {
-                            state.folder_list.next();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Home,
-                            ..
-                        } => {
-                            state.folder_list.first();
-                        }
-                        KeyEvent {
-                            code: KeyCode::End, ..
-                        } => {
-                            state.folder_list.last();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let selected = state.folder_list.state.selected();
-                            match selected {
-                                Some(index) => {
-                                    let selected_item =
-                                        state.folder_list.items.get(index).ok_or(Err::<
-                                            String,
-                                            std::io::Error,
-                                        >(
-                                            std::io::Error::new(
-                                                ErrorKind::Other,
-                                                "Incompatible folder list item",
-                                            ),
-                                        ));
-                                    debug!("Selected folder \"{}\"", selected_item.unwrap());
-                                }
-                                None => warn!("No folder selected"),
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
-                InputMode::Model => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Tab, ..
-                        } => state.change_mode(InputMode::Folder),
-                        KeyEvent {
-                            code: KeyCode::Up, ..
-                        } => {
-                            state.models_table.previous();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Down,
-                            ..
-                        } => {
-                            state.models_table.next();
-                        }
-                        KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        } => {
-                            let selected = state.models_table.state.selected();
-                            match selected {
-                                Some(index) => {
-                                    let selected_row =
-                                        state.models_table.rows.get(index).ok_or(Err::<
-                                            String,
-                                            std::io::Error,
-                                        >(
-                                            std::io::Error::new(
-                                                ErrorKind::Other,
-                                                "Incompatible model row item",
-                                            ),
-                                        ));
-                                    debug!("Selected model \"{}\"", selected_row.unwrap()[0]);
-                                }
-                                None => warn!("No model selected"),
-                            }
-                        }
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Model);
-                            state.change_mode(InputMode::Help);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
-                InputMode::Match => match event {
-                    Event::Key(key) => match key {
-                        KeyEvent {
-                            code: KeyCode::Esc, ..
-                        } => state.change_mode(InputMode::Normal),
-                        KeyEvent {
-                            code: KeyCode::Char('h'),
-                            ..
-                        } => {
-                            state.set_help(HelpType::Match);
-                            state.change_mode(InputMode::Help);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
-                InputMode::Help => match event {
-                    Event::Key(key) => match key {
-                        _ => {
-                            let previous_mode = state.previous_mode;
-                            state.hide_help();
-                            state.change_mode(previous_mode);
-                        }
-                    },
-                    _ => {}
-                },
-            }
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(_) => return Err(PtuiError::InputError),
         };
+
+        match state.mode {
+            InputMode::Normal => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Char('q'),
+                        ..
+                    } => {
+                        return Ok(());
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('f'),
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => {
+                        state.change_mode(InputMode::Folder);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } => {
+                        state.change_mode(InputMode::Search);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('m'),
+                        ..
+                    } => state.change_mode(InputMode::Model),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        ..
+                    } => state.change_mode(InputMode::Match),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::General);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        ..
+                    } => {
+                        state.display_tenants = true;
+                        state.change_mode(InputMode::Tenant);
+                    }
+                    _ => {
+                        warn!("Unsupported key binding. Press <h> for help");
+                        state.status_line = String::from("Press <h> for help or <q> to exit");
+                    }
+                },
+                _ => {}
+            },
+            InputMode::Search => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => match &state.active_folder {
+                        Some(folder) => {
+                            let text = state.search_field.lines()[0].clone();
+                            if !text.is_empty() {
+                                debug!(
+                                    "Searching for \"{}\" in folder {}",
+                                    text,
+                                    folder.name.clone()
+                                );
+
+                                let api = &state.api;
+                                match api {
+                                    Some(api) => {
+                                        let folders = vec![folder.id];
+                                        let result =
+                                            api.list_all_models(folders, Some(&text), false);
+                                        match result {
+                                            Ok(mut models) => {
+                                                models.models.sort_by(|a, b| a.name.cmp(&b.name));
+                                                info!(
+                                                    "Found {} model(s) matching the search clause",
+                                                    models.models.len()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("{}", e);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        error!("No connection to Physna yet!");
+                                    }
+                                }
+                            } else {
+                                warn!("Please, enter a search clause");
+                            }
+                        }
+                        None => {
+                            state.status_line =
+                                String::from("Please, select a folder for the search");
+                            warn!("Please, select a folder from the list of folders before you can search");
+                        }
+                    },
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => {
+                        state.set_help(HelpType::Search);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {
+                        let input: Input = Input {
+                            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                            alt: key.modifiers.contains(KeyModifiers::ALT),
+                            key: match key.code {
+                                KeyCode::Char(c) => tui_textarea::Key::Char(c),
+                                KeyCode::Backspace => tui_textarea::Key::Backspace,
+                                KeyCode::Enter => tui_textarea::Key::Enter,
+                                KeyCode::Left => tui_textarea::Key::Left,
+                                KeyCode::Right => tui_textarea::Key::Right,
+                                KeyCode::Up => tui_textarea::Key::Up,
+                                KeyCode::Down => tui_textarea::Key::Down,
+                                KeyCode::Tab => tui_textarea::Key::Tab,
+                                KeyCode::Delete => tui_textarea::Key::Delete,
+                                KeyCode::Home => tui_textarea::Key::Home,
+                                KeyCode::End => tui_textarea::Key::End,
+                                KeyCode::PageUp => tui_textarea::Key::PageUp,
+                                KeyCode::PageDown => tui_textarea::Key::PageDown,
+                                KeyCode::Esc => tui_textarea::Key::Esc,
+                                KeyCode::F(x) => tui_textarea::Key::F(x),
+                                _ => tui_textarea::Key::Null,
+                            },
+                        };
+                        state.search_field.input(input);
+                    }
+                },
+                _ => {}
+            },
+            InputMode::Folder => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => state.change_mode(InputMode::Model),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Folder);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.folder_list.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.folder_list.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.folder_list.first();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.folder_list.last();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.folder_list.state.selected();
+                        match selected {
+                            Some(index) => match state.folder_list.items.get(index) {
+                                Some(folder) => {
+                                    let name = folder.name.to_owned();
+                                    let id = folder.id;
+                                    state.active_folder = Some(folder.clone());
+                                    debug!("Selected folder [{}] \"{}\"", id, name.clone());
+
+                                    match &state.api {
+                                        Some(api) => {
+                                            debug!(
+                                                "Reading the list of models for folder {}...",
+                                                id
+                                            );
+
+                                            let mut folders: Vec<u32> = Vec::new();
+                                            folders.push(id);
+
+                                            let models = api.list_all_models(folders, None, false);
+                                            match models {
+                                                Ok(mut models) => {
+                                                    debug!(
+                                                        "Found {} model(s)",
+                                                        models.models.len()
+                                                    );
+
+                                                    state.models_table.clear();
+                                                    models
+                                                        .models
+                                                        .sort_by(|a, b| a.name.cmp(&b.name));
+                                                    models.models.iter().cloned().for_each(
+                                                        |model| {
+                                                            state.models_table.add_row(model);
+                                                        },
+                                                    );
+                                                    state.models_table.state.select(Some(0));
+                                                }
+                                                Err(e) => error!("Error reading models: {}", e),
+                                            }
+                                        }
+                                        None => {
+                                            state.active_folder = None;
+                                            state.models_table.clear();
+                                        }
+                                    }
+                                }
+                                None => {
+                                    state.active_folder = None;
+                                    state.models_table.clear();
+                                }
+                            },
+                            None => {
+                                state.active_folder = None;
+                                state.models_table.clear();
+                                warn!("No folder selected");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            InputMode::Model => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => state.change_mode(InputMode::Folder),
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.models_table.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.models_table.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
+                        state.models_table.page_up();
+                    }
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
+                        state.models_table.page_down();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.models_table.home();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.models_table.end();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('n'),
+                        ..
+                    } => {
+                        // sort by name
+                        state.models_table.rows.sort_by(|a, b| a.name.cmp(&b.name));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        ..
+                    } => {
+                        // sort by type
+                        state
+                            .models_table
+                            .rows
+                            .sort_by(|a, b| a.file_type.cmp(&b.file_type));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } => {
+                        // sort by state
+                        state
+                            .models_table
+                            .rows
+                            .sort_by(|a, b| a.state.cmp(&b.state));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('r'),
+                        ..
+                    } => {
+                        // refresh
+                        match &state.api {
+                            Some(api) => match &state.active_folder {
+                                Some(folder) => {
+                                    info!(
+                                        "Reloading the list of models for folder {}...",
+                                        folder.name.clone()
+                                    );
+                                    match api.list_all_models(vec![folder.id], None, false) {
+                                        Ok(mut models) => {
+                                            models.models.sort_by(|a, b| a.name.cmp(&b.name));
+                                            state.models_table.rows = models.models.clone();
+                                            info!("Models reloaded");
+                                        }
+                                        Err(e) => error!("{}", e),
+                                    }
+                                }
+                                None => warn!("Select a folder first"),
+                            },
+                            None => warn!("Connect to Physna first"),
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('p'),
+                        ..
+                    } => {
+                        // reprocess
+                        let selected = state.models_table.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_row = state.models_table.rows.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible model row item",
+                                    ),
+                                ));
+
+                                let model = selected_row.unwrap().clone();
+                                debug!("Selected model \"{}\"", model.uuid.clone());
+                                state.active_model = Some(model.clone());
+
+                                match &state.api {
+                                    Some(api) => match api.reprocess_model(&model.uuid) {
+                                        Ok(()) => {
+                                            info!(
+                                                "Model {} submitted for reprocessing. Refresh models to check status",
+                                                model.uuid.to_string()
+                                            );
+                                        }
+                                        Err(e) => error!("{}", e),
+                                    },
+                                    None => error!("Not connected to Physna"),
+                                }
+                            }
+                            None => warn!("Select a model for reprocessing"),
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.models_table.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_row = state.models_table.rows.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible model row item",
+                                    ),
+                                ));
+
+                                let model = selected_row.unwrap();
+                                debug!("Selected model \"{}\"", model.uuid);
+                                state.active_model = Some(model.clone());
+                                state.change_mode(InputMode::ModelDetail);
+                            }
+                            None => warn!("No model selected"),
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Model);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            InputMode::ModelDetail => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let tenant = state.active_tenant.as_ref().unwrap();
+                        match &state.active_model {
+                            Some(model) => {
+                                let url = format!(
+                                    "https://{}.physna.com/app/models/{}",
+                                    tenant,
+                                    model.uuid.to_string()
+                                );
+                                open::that(url.as_str()).unwrap();
+                            }
+                            None => {}
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::ModelDetail);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {
+                        state.change_mode(InputMode::Model);
+                    }
+                },
+                _ => {}
+            },
+            InputMode::Match => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => state.change_mode(InputMode::Normal),
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Match);
+                        state.change_mode(InputMode::Help);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            InputMode::Help => match event {
+                Event::Key(key) => match key {
+                    _ => {
+                        let previous_mode = state.previous_mode;
+                        state.hide_help();
+                        state.change_mode(previous_mode);
+                    }
+                },
+                _ => {}
+            },
+            InputMode::Tenant => match event {
+                Event::Key(key) => match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => {
+                        state.display_tenants = false;
+                        state.change_mode(InputMode::Normal)
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } => {
+                        state.set_help(HelpType::Tenant);
+                        state.change_mode(InputMode::Help);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.tenants.previous();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.tenants.next();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } => {
+                        state.tenants.first();
+                    }
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } => {
+                        state.tenants.last();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = state.tenants.state.selected();
+                        match selected {
+                            Some(index) => {
+                                let selected_item = state.tenants.items.get(index).ok_or(Err::<
+                                    String,
+                                    std::io::Error,
+                                >(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Incompatible tenant list item",
+                                    ),
+                                ));
+
+                                let active_tenant = selected_item.unwrap().to_owned();
+                                state.active_tenant = Some(active_tenant.clone());
+                                info!("Selected tenant \"{}\"", active_tenant.clone());
+
+                                match state.initialize_service() {
+                                    Ok(()) => {
+                                        debug!("Connected to the Physna service");
+                                    }
+                                    Err(e) => {
+                                        error!("Unable to connect to Physna, because of: {}", e)
+                                    }
+                                }
+
+                                // reloading the list of folders
+                                match &state.api {
+                                    Some(api) => {
+                                        let folders = api.get_list_of_folders();
+                                        match folders {
+                                            Ok(mut folders) => {
+                                                state.clear_folders();
+                                                folders.folders.sort();
+                                                folders.folders.iter().for_each(|f| {
+                                                    state.add_folder(f.clone());
+                                                });
+                                                state.folder_list.state.select(Some(0));
+                                                debug!("List of folders ready");
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to read the list of fodlers: {}", e);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        warn!("No connection with Physna");
+                                    }
+                                }
+
+                                state.display_tenants = false;
+                                state.change_mode(InputMode::Normal);
+                            }
+                            None => {
+                                state.active_tenant = None;
+                                warn!("No tenant selected");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+        }
     }
 }
 
-fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
+fn ui<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
     let size = f.size();
+
+    let active_tenant = state
+        .active_tenant
+        .as_ref()
+        .unwrap_or(&String::from("None"))
+        .to_owned();
 
     // Main container
     let app_container = Block::default()
-        .title(Span::styled(
-            "Physna TUI",
-            Style::default()
-                .fg(Color::White)
-                //.bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(Spans::from(vec![
+            Span::styled(
+                "Physna TUI (",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                active_tenant,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ")",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
@@ -699,16 +1234,27 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
         .split(container_chunks[1]);
 
     folders_section(f, state, content_chunks[0]);
 
+    let active_folder_name = match &state.active_folder {
+        Some(folder) => format!("{}", folder.name.clone()),
+        None => String::from(""),
+    };
+
+    let title = format!(
+        "Models ({}:{})",
+        active_folder_name,
+        state.models_table.rows.len()
+    );
+
     let models_list_section_block = Block::default()
-        .title("Models")
+        .title(title.as_str())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .style(match state.borrow().mode {
+        .style(match state.mode {
             InputMode::Model => Style::default().fg(Color::Yellow),
             _ => Style::default(),
         });
@@ -741,12 +1287,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     f.render_widget(status_block, container_chunks[3]);
     status_section(f, state, container_chunks[3]);
 
+    model_details_section(f, state);
+
+    tenant_selection_section(f, state);
+
     help_section(f, state);
 }
 
-fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
-
+fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>, area: Rect) {
     let folder_list_chunk = Layout::default()
         .margin(2)
         .direction(Direction::Vertical)
@@ -768,7 +1316,7 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
         .items
         .iter()
         .cloned()
-        .map(|i| ListItem::new(i))
+        .map(|i| ListItem::new(format!("[{: >4}] {}", i.id, i.name)))
         .collect();
 
     let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
@@ -781,15 +1329,11 @@ fn folders_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: R
         )
         .highlight_symbol(selection_indicator.as_str());
 
-    f.render_stateful_widget(
-        folder_list,
-        folder_list_chunk[0],
-        &mut state.folder_list.state,
-    );
+    let mut folder_list_state = state.folder_list.state.clone();
+    f.render_stateful_widget(folder_list, folder_list_chunk[0], &mut folder_list_state);
 }
 
-fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let state = state.borrow();
+fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>, area: Rect) {
     let text = vec![Spans::from(vec![
         Span::styled(
             format!(" {} ", char::from_u32(0x25B6).unwrap()),
@@ -813,12 +1357,14 @@ fn status_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
     f.render_widget(status, status_chunk[0]);
 }
 
-fn search_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
-
+fn search_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area: Rect) {
     state.search_field.set_style(Style::default());
+    let title = match &state.active_folder {
+        Some(folder) => format!("Search ({})", folder.name.clone()),
+        None => format!("Search"),
+    };
     let search_block = Block::default()
-        .title("Search")
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(match state.mode {
@@ -863,9 +1409,77 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
-    let state = state.borrow();
+fn model_details_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>) {
+    match state.mode {
+        InputMode::ModelDetail if state.active_model.is_some() => {
+            let block = Block::default().title("Model").borders(Borders::ALL);
+            let area = centered_rect(45, 17, f.size());
+            f.render_widget(Clear, area); //this clears out the background
+            f.render_widget(block, area);
 
+            let margin = Margin {
+                horizontal: 2,
+                vertical: 2,
+            };
+            let content_area = area.inner(&margin);
+            let model_detail_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(100)].as_ref())
+                .split(content_area);
+
+            fn create_spans<'a>(name: &'a str, value: &'a String, color: Color) -> Spans<'a> {
+                Spans::from(vec![
+                    Span::styled(
+                        format!("{: <15} {} ", name, ":"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(value.as_str(), Style::default().fg(color)),
+                ])
+            }
+
+            let model = state.active_model.as_ref().unwrap().clone();
+            let uuid = model.uuid.to_string();
+            let name = model.name.clone();
+            let is_assembly = model.is_assembly.to_string();
+            let folder_id = model.folder_id.to_string();
+            let owner_id = model.owner_id.clone();
+            let created_at = model.created_at.clone();
+            let file_type = model.file_type.clone();
+            let units = model.units.clone();
+            let state = model.state.clone();
+            let attachment_url = model.attachment_url.unwrap_or_default();
+            let short_id = model.short_id.unwrap_or_default().to_string();
+            // let metadata: Option<Vec<ModelMetadataItem>>,
+
+            let mut props: Vec<Spans> = Vec::new();
+            props.push(create_spans("UUID", &uuid, Color::Yellow));
+            props.push(create_spans("Name", &name, Color::Yellow));
+            props.push(create_spans("Assembly", &is_assembly, Color::Yellow));
+            props.push(create_spans("Folder ID", &folder_id, Color::Yellow));
+            props.push(create_spans("Owner ID", &owner_id, Color::Yellow));
+            props.push(create_spans("Created At", &created_at, Color::Yellow));
+            props.push(create_spans("File Type", &file_type, Color::Yellow));
+            props.push(create_spans("Units", &units, Color::Yellow));
+            let status_color = match state.as_str() {
+                "finished" => Color::Green,
+                _ => Color::Red,
+            };
+            props.push(create_spans("State", &state, status_color));
+            props.push(create_spans(
+                "Attachment URL",
+                &attachment_url,
+                Color::Yellow,
+            ));
+            props.push(create_spans("Short ID", &short_id, Color::Yellow));
+
+            let props_paragraph = Paragraph::new(props).wrap(Wrap { trim: true });
+            f.render_widget(props_paragraph, model_detail_chunks[0]);
+        }
+        _ => {}
+    }
+}
+
+fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefMut<State>) {
     if state.show_help() {
         let block = Block::default().title("Help").borders(Borders::ALL);
         let area = centered_rect(50, 50, f.size());
@@ -881,14 +1495,52 @@ fn help_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>) {
     }
 }
 
-fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Rect) {
-    let mut state = state.borrow_mut();
+fn tenant_selection_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>) {
+    if state.display_tenants {
+        let block = Block::default().title("Tenant").borders(Borders::ALL);
+        let area = centered_rect(30, 50, f.size());
+        f.render_widget(Clear, area); //this clears out the background
+        f.render_widget(block, area);
 
-    let rects = Layout::default()
-        .constraints([Constraint::Percentage(100)].as_ref())
-        .margin(5)
-        .split(f.size());
+        let margin = Margin {
+            horizontal: 2,
+            vertical: 2,
+        };
 
+        let tenant_list_section_block = Block::default()
+            .title("Folders")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(match state.mode {
+                InputMode::Tenant => Style::default().fg(Color::Yellow),
+                _ => Style::default(),
+            });
+        f.render_widget(tenant_list_section_block, area);
+
+        // transform a vector of Strings to a vector of ListItems
+        let visible_items: Vec<ListItem> = state
+            .tenants
+            .items
+            .iter()
+            .cloned()
+            .map(|i| ListItem::new(i))
+            .collect();
+
+        let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
+        let tenants_list = List::new(visible_items)
+            .highlight_style(
+                Style::default().add_modifier(Modifier::REVERSED),
+                // .fg(Color::Black)
+                // .bg(Color::LightBlue)
+                // .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(selection_indicator.as_str());
+
+        f.render_stateful_widget(tenants_list, area.inner(&margin), &mut state.tenants.state);
+    }
+}
+
+fn models_section<B: Backend>(f: &mut Frame<B>, state: &mut RefMut<State>, area: Rect) {
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let normal_style = Style::default().bg(Color::White);
     let header_cells = state.models_table.columns.iter().map(|h| {
@@ -903,15 +1555,19 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
         .height(1)
         .bottom_margin(1);
 
-    let rows = state.models_table.rows.iter().map(|item| {
-        let height = item
-            .iter()
-            .map(|content| content.chars().filter(|c| *c == '\n').count())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let cells = item.iter().cloned().map(|c| Cell::from(c));
-        Row::new(cells).height(height as u16).bottom_margin(0)
+    let rows = state.models_table.rows.iter().map(|model| {
+        let state_color = match model.state.as_str() {
+            "finished" => Color::Green,
+            _ => Color::Red,
+        };
+
+        let mut cells: Vec<Cell> = Vec::new();
+        cells.push(Cell::from(model.name.clone()));
+        cells.push(Cell::from(model.file_type.clone()));
+        cells.push(Cell::from(model.is_assembly.to_string()));
+        cells.push(Cell::from(model.state.clone()).style(Style::default().fg(state_color)));
+        cells.push(Cell::from(model.uuid.to_string()));
+        Row::new(cells).height(1).bottom_margin(0)
     });
 
     let selection_indicator = format!(" {}", char::from_u32(0x25B6).unwrap());
@@ -920,9 +1576,11 @@ fn models_section<B: Backend>(f: &mut Frame<B>, state: &RefCell<State>, area: Re
         .highlight_style(selected_style)
         .highlight_symbol(selection_indicator.as_str())
         .widths(&[
-            Constraint::Percentage(50),
             Constraint::Length(30),
-            Constraint::Min(10),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(15),
+            Constraint::Length(36),
         ]);
 
     let margin = Margin {
