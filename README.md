@@ -8,3 +8,6 @@ The goal of this project is to create a terminal user interface (TUI) client for
 ## Architecture
 
 ... to be continued ...
+
+## User Guide
+
